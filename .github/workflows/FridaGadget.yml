@@ -27,8 +27,8 @@ on:
         description: "необязательно: путь к .js в репозитории, который вшить в бандл"
         default: ""
       script_dir:
-        description: "папка скрипта внутри .app: пусто = корень .app, Frameworks = рядом с dylib"
-        default: ""
+        description: "Documents (На iPhone -> приложение, не вшивается) | Frameworks | root | своя папка в .app"
+        default: "Documents"
       code_signing:
         description: режим code_signing в конфиге гаджета
         default: "required"
@@ -129,23 +129,32 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work/gadget
-          DIR="${SCRIPT_DIR:-}"
+          DIR="${SCRIPT_DIR:-Documents}"
           DIR="${DIR#/}"
           DIR="${DIR%/}"
-          case "$DIR" in
-            ""|".")
-              PATH_VALUE="../$SCRIPT_NAME"
-              DIR=""
-              ;;
-            Frameworks)
+          LC="$(printf '%s' "$DIR" | tr '[:upper:]' '[:lower:]')"
+          EMBED=1
+          case "$LC" in
+            ""|documents)
               PATH_VALUE="$SCRIPT_NAME"
+              DIR="Documents"
+              EMBED=0
+              ;;
+            frameworks)
+              PATH_VALUE="$SCRIPT_NAME"
+              DIR="Frameworks"
+              ;;
+            root|".")
+              PATH_VALUE="../$SCRIPT_NAME"
+              DIR="root"
               ;;
             *)
               PATH_VALUE="../$DIR/$SCRIPT_NAME"
               ;;
           esac
-          echo "скрипт: ${DIR:-<корень .app>} | path в конфиге: $PATH_VALUE"
+          echo "скрипт: $DIR | path в конфиге: $PATH_VALUE | вшивается в IPA: $EMBED"
           echo "SCRIPT_DIR_NORM=$DIR" >> "$GITHUB_ENV"
+          echo "SCRIPT_EMBED=$EMBED" >> "$GITHUB_ENV"
           cat > work/gadget/FridaGadget.config <<CFG
           {
             "interaction": {
@@ -226,10 +235,16 @@ jobs:
 
           shutil.copyfile(cfg, os.path.join(frameworks, 'config.json'))
 
+          embed = (os.environ.get('SCRIPT_EMBED') or '1').strip() == '1'
+          script_dir = (os.environ.get('SCRIPT_DIR_NORM') or '').strip()
           script_src = os.path.join('work', 'gadget', script_name)
-          if os.path.exists(script_src):
-              script_dir = (os.environ.get('SCRIPT_DIR') or '').strip().strip('/')
-              target_dir = app if script_dir in ('', '.') else os.path.join(app, script_dir)
+
+          if not os.path.exists(script_src):
+              print('скрипт не передан (script_file пустой)')
+          elif not embed:
+              print('скрипт не вшивается: положи его вручную в «На iPhone» -> <приложение>, имя %s' % script_name)
+          else:
+              target_dir = app if script_dir in ('', 'root') else os.path.join(app, script_dir)
               os.makedirs(target_dir, exist_ok=True)
               shutil.copyfile(script_src, os.path.join(target_dir, script_name))
               print('вшит скрипт:', os.path.relpath(os.path.join(target_dir, script_name), app))
@@ -297,14 +312,21 @@ jobs:
           for f in Frameworks/FridaGadget.dylib Frameworks/FridaGadget.config Frameworks/config.json; do
             [ -f "$APP_VERIFY/$f" ] || { echo "в патченом IPA нет $f"; exit 1; }
           done
-          if [ -n "$SCRIPT_FILE" ]; then
-            if [ -n "$SCRIPT_DIR_NORM" ]; then
-              SCRIPT_IN_IPA="$APP_VERIFY/$SCRIPT_DIR_NORM/$SCRIPT_NAME"
-            else
-              SCRIPT_IN_IPA="$APP_VERIFY/$SCRIPT_NAME"
-            fi
+          echo "== конфиг гаджета =="
+          cat "$APP_VERIFY/Frameworks/FridaGadget.config"
+
+          if [ "${SCRIPT_EMBED:-1}" = "1" ] && [ -n "$SCRIPT_FILE" ]; then
+            case "$SCRIPT_DIR_NORM" in
+              ""|root) SCRIPT_IN_IPA="$APP_VERIFY/$SCRIPT_NAME" ;;
+              *) SCRIPT_IN_IPA="$APP_VERIFY/$SCRIPT_DIR_NORM/$SCRIPT_NAME" ;;
+            esac
             [ -f "$SCRIPT_IN_IPA" ] || { echo "в патченом IPA нет скрипта $SCRIPT_IN_IPA"; exit 1; }
             echo "скрипт в IPA: ${SCRIPT_IN_IPA#$APP_VERIFY/}"
+          elif [ "${SCRIPT_EMBED:-1}" = "0" ]; then
+            echo "режим Documents: скрипт в IPA не вшит, ожидается вручную как $SCRIPT_NAME"
+            if unzip -Z1 "$OUT_IPA" | grep -q "/$SCRIPT_NAME\$"; then
+              echo "внимание: в IPA всё же найден файл $SCRIPT_NAME"
+            fi
           fi
 
           echo "== frida-записи в итоговом IPA (должны быть только наши) =="
