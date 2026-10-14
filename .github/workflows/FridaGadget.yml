@@ -30,6 +30,17 @@ jobs:
         with:
           node-version: "20"
 
+      - name: ldid
+        run: |
+          brew install libplist openssl@3 >/dev/null
+          export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix libplist)/lib/pkgconfig"
+          git clone --depth 1 https://github.com/ProcursusTeam/ldid.git ldid-src
+          make -C ldid-src -j4
+          mkdir -p "$HOME/bin"
+          cp ldid-src/ldid "$HOME/bin/ldid"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/ldid" -h 2>&1 | head -3 || true
+
       - name: source
         run: |
           git clone --depth 1 --branch "${{ inputs.version }}" https://github.com/frida/frida.git frida
@@ -48,6 +59,12 @@ jobs:
             -Dfrida-core:connectivity=disabled \
             -Dfrida-core:apple_tls=disabled \
             -Dfrida-core:socket_backend=disabled \
+            -Dfrida-core:local_backend=disabled \
+            -Dfrida-core:simmy_backend=disabled \
+            -Dfrida-core:fruity_backend=disabled \
+            -Dfrida-core:droidy_backend=disabled \
+            -Dfrida-core:barebone_backend=disabled \
+            -Dfrida-core:compiler_backend=disabled \
             -Dfrida-core:compat=disabled \
             -Dfrida-core:tests=disabled \
             -Dfrida-core:server=disabled \
@@ -87,6 +104,11 @@ jobs:
           cp "$CAND" gadget.dylib
           ls -l gadget.dylib
           lipo -archs gadget.dylib || true
+          echo "== segments"
+          size -m gadget.dylib | head -30 || true
+          echo "== openssl/lzfse strings"
+          strings -a gadget.dylib | grep -ciE "openssl|libcrypto" || true
+          strings -a gadget.dylib | grep -ci "lzfse" || true
 
       - name: framework
         env:
