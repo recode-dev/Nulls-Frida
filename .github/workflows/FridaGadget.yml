@@ -1,240 +1,369 @@
 name: FridaGadget
 
+# Вшивание своего Frida Gadget в IPA вместо гаджета разработчика IPA.
+#
+# Пайплайн:
+#   1. tools/ExecutablePatch.py --resolve   -> прямая ссылка на .ipa
+#   2. tools/ExecutablePatch.py --drop-lc   -> из бандла вырезается dev-овский
+#      Frida.framework и висячий LC_LOAD_DYLIB (с починкой ordinal'ов в chained fixups)
+#   3. objection (IosGadget/IosPatcher)     -> вшивается наш dylib + конфиг
+#   4. ad-hoc подпись (codesign -s -)       -> без сертификата Apple
+#
+# Почему не `objection patchipa`: он требует --codesign-signature (required=True),
+# не имеет флага "не подписывать" и внутри всегда зовёт applesign с --mobileprovision.
+# Без сертификата и профиля этот путь не проходит, поэтому вызываются те же классы
+# objection напрямую, а пересборка IPA и ad-hoc подпись делаются вручную.
+#
+# Секреты не нужны. Версия гаджета и ссылка на IPA определяются сами.
+
 on:
   workflow_dispatch:
     inputs:
+      url:
+        description: ipa endpoint
+        required: false
+        default: https://nulls.ee/bs_latest_i
       version:
-        description: frida tag
-        default: "17.23.3"
-      max_mb:
-        description: fail if the framework binary is bigger
-        default: "5"
-      script:
-        description: gadget script path inside the app
-        default: agent.js
-      code_signing:
-        description: gadget code_signing mode
-        default: required
-      preset:
-        description: configure preset
-        type: choice
-        options:
-          - minimal
-          - vanilla
-          - trimmed
-          - nodiet
-        default: minimal
-      extra_flags:
-        description: extra -D flags
+        description: тег Frida; пусто = последний релиз
         default: ""
+      drop_lc:
+        description: вырезать загрузку Frida.framework разработчика IPA
+        type: boolean
+        default: true
+      custom_gadget_url:
+        description: "необязательно: URL своей сборки FridaGadget.dylib (релизная не качается)"
+        default: ""
+      max_mb:
+        description: упасть, если dylib гаджета в итоговом IPA больше, МБ (0 = не проверять)
+        default: "40"
+      script:
+        description: имя JS рядом с конфигом (это же имя идёт в "path" конфига)
+        default: "agent.js"
+      script_file:
+        description: "необязательно: путь к .js в репозитории, который вшить в бандл"
+        default: ""
+      code_signing:
+        description: режим code_signing в конфиге гаджета
+        default: "required"
 
 jobs:
-  build:
+  patch:
     runs-on: macos-14
-    timeout-minutes: 180
+    timeout-minutes: 120
     env:
-      IOS_CERTID: "-"
-      MACOS_CERTID: "-"
+      OBJECTION_VERSION: "1.12.5"
+      IPA_URL: ${{ inputs.url }}
+      FRIDA_VERSION: ${{ inputs.version }}
+      CUSTOM_GADGET_URL: ${{ inputs.custom_gadget_url }}
+      MAX_MB: ${{ inputs.max_mb }}
+      SCRIPT_NAME: ${{ inputs.script }}
+      SCRIPT_FILE: ${{ inputs.script_file }}
+      CODE_SIGNING: ${{ inputs.code_signing }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: ldid
+      - name: toolchain
         run: |
-          brew install libplist openssl@3 >/dev/null
-          export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix libplist)/lib/pkgconfig"
-          git clone --depth 1 https://github.com/ProcursusTeam/ldid.git ldid-src
-          make -C ldid-src -j4
-          mkdir -p "$HOME/bin"
-          cp ldid-src/ldid "$HOME/bin/ldid"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-          "$HOME/bin/ldid" -h 2>&1 | head -3 || true
-
-      - name: source
-        run: |
-          git clone --depth 1 --branch "${{ inputs.version }}" https://github.com/frida/frida.git frida
-          git -C frida log --oneline -1
-
-      - name: configure
-        working-directory: frida
-        env:
-          PRESET: ${{ inputs.preset }}
-          EXTRA: ${{ inputs.extra_flags }}
-        run: |
-          case "$PRESET" in
-            vanilla)
-              FLAGS="-Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled"
-              ;;
-            nodiet)
-              FLAGS="-Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-gum:graft_tool=disabled -Dfrida-gum:jailbreak=disabled -Dfrida-gum:tests=disabled -Dfrida-core:connectivity=disabled -Dfrida-core:apple_tls=disabled -Dfrida-core:socket_backend=disabled -Dfrida-core:local_backend=disabled -Dfrida-core:simmy_backend=disabled -Dfrida-core:fruity_backend=disabled -Dfrida-core:droidy_backend=disabled -Dfrida-core:barebone_backend=disabled -Dfrida-core:compiler_backend=disabled -Dfrida-core:compat=disabled -Dfrida-core:tests=disabled -Dfrida-core:server=disabled -Dfrida-core:portal=disabled -Dfrida-core:inject=disabled -Dfrida-core:gadget=enabled -Dfrida-core:assets=embedded"
-              ;;
-            trimmed)
-              FLAGS="-Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-gum:diet=true -Dfrida-gum:graft_tool=disabled -Dfrida-gum:jailbreak=disabled -Dfrida-gum:tests=disabled -Dfrida-core:connectivity=disabled -Dfrida-core:apple_tls=disabled -Dfrida-core:socket_backend=disabled -Dfrida-core:local_backend=disabled -Dfrida-core:simmy_backend=disabled -Dfrida-core:fruity_backend=disabled -Dfrida-core:droidy_backend=disabled -Dfrida-core:barebone_backend=disabled -Dfrida-core:compiler_backend=disabled -Dfrida-core:compat=disabled -Dfrida-core:tests=disabled -Dfrida-core:server=disabled -Dfrida-core:portal=disabled -Dfrida-core:inject=disabled -Dfrida-core:gadget=enabled -Dfrida-core:assets=embedded"
-              ;;
-            *)
-              FLAGS="-Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-core:connectivity=disabled -Dfrida-core:socket_backend=disabled -Dfrida-core:compat=disabled"
-              ;;
-          esac
-          echo "preset $PRESET"
-          echo "flags $FLAGS $EXTRA"
-          if ! ./configure --host=ios-arm64 -- $FLAGS $EXTRA; then
-            echo "configure failed; options:"
-            sed -n '1,140p' subprojects/frida-gum/meson.options || true
-            sed -n '1,140p' subprojects/frida-core/meson.options || true
-            exit 1
-          fi
-
-      - name: make
-        working-directory: frida
-        run: |
-          if ! make; then
-            echo "== cert related options:"
-            grep -rniE "certid|identity|codesign" subprojects/frida-core/meson.options subprojects/frida-core/meson.build 2>/dev/null | head -20 || true
-            exit 1
-          fi
-
-      - name: gadget
-        run: |
-          CAND=""
-          for P in frida/build/lib/gadget/frida-gadget.dylib $(find frida/build -name "*gadget*.dylib" -type f 2>/dev/null); do
-            case "$P" in *arm64e*|*compat*) continue ;; esac
-            if [ -s "$P" ]; then CAND="$P"; break; fi
-          done
-          if [ -z "$CAND" ]; then
-            echo "no gadget dylib; what the build made:"
-            find frida/build -name "*.dylib" -type f -exec ls -l {} \; | head -30
-            find frida/build -maxdepth 6 -type d -name "*frida*" | head -20
-            exit 1
-          fi
-          echo "gadget: $CAND"
-          cp "$CAND" gadget.dylib
-          ls -l gadget.dylib
-          lipo -archs gadget.dylib || true
-          echo "== segments"
-          size -m gadget.dylib | head -30 || true
-          echo "== openssl/lzfse strings"
-          strings -a gadget.dylib | grep -ciE "openssl|libcrypto" || true
-          strings -a gadget.dylib | grep -ci "lzfse" || true
-
-      - name: framework
-        env:
-          FRIDA_VERSION: ${{ inputs.version }}
-          SCRIPT_PATH: ${{ inputs.script }}
-          CODE_SIGNING: ${{ inputs.code_signing }}
-          ARCH: arm64
-        run: |
-          if [ ! -f gadget/mkfw.sh ]; then
-            mkdir -p gadget
-            cat > gadget/mkfw.sh <<'EOF'
-          #!/usr/bin/env bash
           set -euo pipefail
+          mkdir -p work out
 
-          DYLIB=${1:?usage: mkfw.sh <gadget.dylib> [outdir]}
-          OUT=${2:-.}
-          VER=${FRIDA_VERSION:-unknown}
-          SCRIPT=${SCRIPT_PATH:-agent.js}
-          CS=${CODE_SIGNING:-required}
-          ARCH=${ARCH:-arm64}
-          FW="$OUT/FridaGadget.framework"
-          ID='@executable_path/Frameworks/FridaGadget.framework/FridaGadget'
+          # lief нужен tools/ExecutablePatch.py, insert_dylib — objection
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet lief "objection==${OBJECTION_VERSION}"
 
-          rm -rf "$FW"
-          mkdir -p "$FW"
-          cp "$DYLIB" "$FW/FridaGadget"
-          chmod 755 "$FW/FridaGadget"
+          git clone --depth 1 https://github.com/Tyilo/insert_dylib insert_dylib-src
+          (cd insert_dylib-src && xcodebuild -configuration Release >/dev/null)
+          BIN="$(find insert_dylib-src -type f -name insert_dylib -perm -111 | head -1)"
+          [ -n "$BIN" ] || { echo "insert_dylib не собрался"; exit 1; }
+          sudo cp -f "$BIN" /usr/local/bin/insert_dylib
+          chmod +x /usr/local/bin/insert_dylib
 
-          if command -v lipo >/dev/null 2>&1; then
-            ARCHS=$(lipo -archs "$FW/FridaGadget" 2>/dev/null || echo "")
-            case "$ARCHS" in
-              *" "*)
-                lipo -thin "$ARCH" "$FW/FridaGadget" -output "$FW/FridaGadget.thin"
-                mv "$FW/FridaGadget.thin" "$FW/FridaGadget"
-                echo "thin: $ARCH (was: $ARCHS)"
-                ;;
-              *) echo "arch: $ARCHS" ;;
-            esac
+          python3 -c 'import lief; print("lief", lief.__version__)'
+          objection version 2>&1 | tail -1 || true
+          for c in insert_dylib codesign security zip unzip plutil xcodebuild; do
+            command -v "$c" || { echo "нет обязательной команды: $c"; exit 1; }
+          done
+
+      - name: fetch
+        run: |
+          set -euo pipefail
+          python3 tools/ExecutablePatch.py --resolve "$IPA_URL" | tee work/url.txt
+          curl -fL --retry 3 --retry-delay 5 --max-time 900 -o work/app.ipa "$(tail -1 work/url.txt)"
+          ls -l work/app.ipa
+
+          # проверки: это zip и внутри Payload/*.app
+          unzip -tq work/app.ipa >/dev/null
+          APP_ENTRY="$(unzip -Z1 work/app.ipa | grep -E '^Payload/[^/]+\.app/$' | head -1)"
+          [ -n "$APP_ENTRY" ] || { echo "в IPA нет Payload/*.app"; exit 1; }
+          echo "APP_ENTRY=$APP_ENTRY" >> "$GITHUB_ENV"
+
+          # метаданные бандла и проверка FairPlay
+          mkdir -p work/probe
+          unzip -o -q work/app.ipa "$APP_ENTRY/Info.plist" -d work/probe
+          python3 - <<'PY'
+          import plistlib, pathlib, os
+          p = next(pathlib.Path('work/probe/Payload').glob('*.app/Info.plist'))
+          d = plistlib.loads(p.read_bytes())
+          print('CFBundleIdentifier:', d.get('CFBundleIdentifier'))
+          print('CFBundleExecutable:', d.get('CFBundleExecutable'))
+          print('CFBundleShortVersionString:', d.get('CFBundleShortVersionString'))
+          with open('work/exec-name.txt', 'w') as f:
+              f.write(d.get('CFBundleExecutable') or '')
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('BUNDLE_ID_ORIG=%s\n' % d.get('CFBundleIdentifier'))
+              f.write('EXEC_NAME=%s\n' % d.get('CFBundleExecutable'))
+          PY
+
+          # GITHUB_ENV виден только следующим шагам, поэтому имя бинаря читаем из файла
+          BIN_PATH="$(dirname "$APP_ENTRY")/$(cat work/exec-name.txt)"
+          unzip -o -q work/app.ipa "$BIN_PATH" -d work/probe
+          CRYPTID="$(otool -l "work/probe/$BIN_PATH" | awk '/LC_ENCRYPTION_INFO/{f=1} f&&/^ *cryptid/{print $2; exit}')"
+          echo "cryptid=${CRYPTID:-<нет LC_ENCRYPTION_INFO>}"
+          if [ "${CRYPTID:-0}" != "0" ]; then
+            echo "IPA зашифрован FairPlay (cryptid=$CRYPTID). Патч и переподпись бессмысленны —"
+            echo "нужен расшифрованный дамп. Прерываю."
+            exit 1
           fi
 
-          cat > "$FW/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>FridaGadget</string>
-              <key>CFBundleIdentifier</key>
-              <string>re.frida.gadget</string>
-              <key>CFBundleName</key>
-              <string>FridaGadget</string>
-              <key>CFBundlePackageType</key>
-              <string>FMWK</string>
-              <key>CFBundleShortVersionString</key>
-              <string>$VER</string>
-              <key>CFBundleVersion</key>
-              <string>$VER</string>
-              <key>MinimumOSVersion</key>
-              <string>11.0</string>
-          </dict>
-          </plist>
-          PLIST
+          # что вообще лежит от разработчика
+          echo "== frida-записи в исходном IPA =="
+          unzip -Z1 work/app.ipa | grep -i frida | sed -n '1,20p' || echo "(нет)"
 
-          cat > "$FW/FridaGadget.config" <<CFG
+      - name: strip developer frida
+        run: |
+          set -euo pipefail
+          ARGS=(--ipa work/app.ipa --exe-dir exe --out work/nofrida.ipa)
+          if [ "${{ inputs.drop_lc }}" = "true" ]; then
+            ARGS+=(--drop-lc)
+          else
+            echo "внимание: drop_lc=false, висячий LC_LOAD_DYLIB останется и приложение не запустится"
+          fi
+          python3 tools/ExecutablePatch.py "${ARGS[@]}" | tee work/strip.log
+          ls -l work/nofrida.ipa exe/
+
+      - name: gadget config
+        run: |
+          set -euo pipefail
+          mkdir -p work/gadget
+          cat > work/gadget/FridaGadget.config <<CFG
           {
             "interaction": {
               "type": "script",
-              "path": "$SCRIPT",
-              "on_change": "reload"
+              "path": "$SCRIPT_NAME",
+              "on_change": "reload",
+              "parameters": {}
             },
-            "code_signing": "$CS"
+            "code_signing": "$CODE_SIGNING"
           }
           CFG
+          cat work/gadget/FridaGadget.config
 
-          if command -v install_name_tool >/dev/null 2>&1; then
-            install_name_tool -id "$ID" "$FW/FridaGadget"
-            echo "id -> $ID"
+          if [ -n "$SCRIPT_FILE" ]; then
+            [ -f "$SCRIPT_FILE" ] || { echo "нет файла скрипта: $SCRIPT_FILE"; exit 1; }
+            cp "$SCRIPT_FILE" "work/gadget/$SCRIPT_NAME"
+            ls -l "work/gadget/$SCRIPT_NAME"
           fi
 
-          if command -v ldid >/dev/null 2>&1; then
-            ldid -S "$FW/FridaGadget"
-            echo "signed: ldid"
-          elif command -v codesign >/dev/null 2>&1; then
-            codesign -f -s - "$FW/FridaGadget" 2>/dev/null && echo "signed: codesign ad-hoc"
-          else
-            echo "warn: no ldid/codesign here"
-          fi
-          if command -v codesign >/dev/null 2>&1; then
-            codesign -dvv "$FW/FridaGadget" 2>&1 | grep -E "Signature|Identifier|Format" || true
-          fi
-
-          ls -la "$FW"
-          EOF
-            chmod +x gadget/mkfw.sh
-            echo "wrote gadget/mkfw.sh"
-          fi
-          bash gadget/mkfw.sh gadget.dylib out
-          (cd out && zip -qry ../FridaGadget.framework.zip FridaGadget.framework)
-          ls -l out/FridaGadget.framework FridaGadget.framework.zip
-
-      - name: size
+      - name: custom gadget (optional)
+        if: inputs.custom_gadget_url != ''
         run: |
+          set -euo pipefail
+          GP="$(python3 -c 'from objection.utils.patchers.ios import IosGadget; print(IosGadget.ios_dylib_gadget_path)')"
+          echo "objection gadget path: $GP"
+          mkdir -p "$(dirname "$GP")"
+          curl -fL --retry 3 --max-time 600 "$CUSTOM_GADGET_URL" -o "$GP"
+          lipo -archs "$GP" || true
+          ls -l "$GP"
+
+      - name: inject
+        env:
+          IPA_PATH: work/nofrida.ipa
+          GADGET_CONFIG: work/gadget/FridaGadget.config
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import shutil
+
+          from objection.utils.patchers.github import Github
+          from objection.utils.patchers.ios import IosGadget, IosPatcher
+
+          ipa = os.environ['IPA_PATH']
+          cfg = os.environ['GADGET_CONFIG']
+          script_name = os.environ['SCRIPT_NAME']
+          want = (os.environ.get('FRIDA_VERSION') or '').strip()
+          custom = (os.environ.get('CUSTOM_GADGET_URL') or '').strip()
+
+          # версия: из инпута либо последний релиз Frida
+          gh = Github()
+          version = want or gh.get_latest_version()
+          print('frida release:', version)
+
+          gadget = IosGadget(Github(gadget_version=version))
+          gadget_path = gadget.get_gadget_path()
+
+          if custom:
+              if not os.path.exists(gadget_path):
+                  raise SystemExit('нет файла своей сборки гаджета: %s' % gadget_path)
+              print('использую свою сборку:', gadget_path)
+          else:
+              print('качаю релизный гаджет...')
+              gadget.download().unpack().set_local_version('ios_universal', version).cleanup()
+
+          size = os.path.getsize(gadget_path)
+          print('gadget: %s (%d bytes)' % (gadget_path, size))
+
+          # injection: распаковка, выбор бинаря из Info.plist, вставка dylib,
+          # подпись всех dylib ad-hoc (identity '-')
+          p = IosPatcher(skip_cleanup=True)
+          p.extract_ipa(False, ipa_source=ipa)
+          p.set_application_binary()
+          p.patch_and_codesign_binary(
+              frida_gadget=gadget_path,
+              codesign_signature='-',
+              gadget_config=cfg)
+
+          app = p.app_folder
+          frameworks = os.path.join(app, 'Frameworks')
+
+          # второй экземпляр конфига: на устройстве читался только config.json
+          shutil.copyfile(cfg, os.path.join(frameworks, 'config.json'))
+
+          script_src = os.path.join('work', 'gadget', script_name)
+          if os.path.exists(script_src):
+              shutil.copyfile(script_src, os.path.join(frameworks, script_name))
+              print('вшит скрипт:', script_name)
+
+          # забираем бандл из системного temp в рабочую папку
+          dest = os.path.join('work', 'patched-app', os.path.basename(app))
+          shutil.rmtree(dest, ignore_errors=True)
+          shutil.copytree(app, dest, symlinks=True)
+
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('APP_NAME=%s\n' % os.path.basename(app))
+              f.write('PATCHED_APP_DIR=%s\n' % dest)
+              f.write('GADGET_VERSION=%s\n' % version)
+              f.write('GADGET_SIZE=%d\n' % size)
+          print('inject ok ->', dest)
+          PY
+
+          ls -la "$PATCHED_APP_DIR/Frameworks"
+
+      - name: ad-hoc sign and pack
+        run: |
+          set -euo pipefail
+          APP="$PATCHED_APP_DIR"
+          EXEC="$APP/$EXEC_NAME"
+          [ -f "$EXEC" ] || { echo "нет исполняемого файла $EXEC"; exit 1; }
+
+          # entitlements оригинала, если они вообще есть
+          ORIG_BIN="$(dirname "$APP_ENTRY")/$EXEC_NAME"
+          rm -rf work/orig && mkdir -p work/orig
+          unzip -o -q work/app.ipa "$ORIG_BIN" -d work/orig
+          ENTS=""
+          if codesign -d --entitlements :- "work/orig/$ORIG_BIN" > work/ents.plist 2>/dev/null \
+             && [ -s work/ents.plist ] && [ "$(head -c 1 work/ents.plist)" = "<" ]; then
+            ENTS="--entitlements work/ents.plist"
+            echo "entitlements оригинала подключены"
+          else
+            echo "entitlements не найдены — подписываю без них"
+          fi
+
+          # ad-hoc: сначала все dylib, потом бинарь, потом сам бандл
+          find "$APP" -type f -name '*.dylib' -print0 \
+            | while IFS= read -r -d '' f; do codesign -f -s - "$f"; done
+          # shellcheck disable=SC2086
+          codesign -f -s - $ENTS "$EXEC"
+          codesign -f -s - "$APP"
+
+          echo "== ad-hoc подписи =="
+          codesign -dvv "$EXEC" 2>&1 | grep -E 'Identifier|Signature' || true
+          codesign -dvv "$APP" 2>&1 | grep -E 'Identifier|Signature' || true
+
+          # сборка IPA: Payload/<App>.app
+          rm -rf work/build && mkdir -p work/build/Payload
+          cp -R "$APP" work/build/Payload/
+          OUT="$GITHUB_WORKSPACE/out/$(basename "${APP%.app}")-frida.ipa"
+          (cd work/build && zip -qry "$OUT" Payload)
+          echo "OUT_IPA=$OUT" >> "$GITHUB_ENV"
+          ls -l "$OUT"
+
+      - name: verify
+        run: |
+          set -euo pipefail
+          rm -rf work/verify && mkdir -p work/verify
+          unzip -q "$OUT_IPA" -d work/verify
+          APP_VERIFY="work/verify/${APP_ENTRY%/}"
+          BIN_PATH="${APP_ENTRY%/}/$EXEC_NAME"
+
+          echo "== Frameworks =="
+          ls -la "$APP_VERIFY/Frameworks"
+
+          for f in Frameworks/FridaGadget.dylib Frameworks/FridaGadget.config Frameworks/config.json; do
+            [ -f "$APP_VERIFY/$f" ] || { echo "в патченом IPA нет $f"; exit 1; }
+          done
+          if [ -n "$SCRIPT_FILE" ]; then
+            [ -f "$APP_VERIFY/Frameworks/$SCRIPT_NAME" ] || { echo "в патченом IPA нет скрипта $SCRIPT_NAME"; exit 1; }
+          fi
+
+          echo "== frida-записи в итоговом IPA (должны быть только наши) =="
+          unzip -Z1 "$OUT_IPA" | grep -i frida
+          if unzip -Z1 "$OUT_IPA" | grep -qi 'Frida\.framework'; then
+            echo "Frida.framework разработчика всё ещё в IPA"; exit 1
+          fi
+          FOREIGN="$(unzip -Z1 "$OUT_IPA" | grep -i frida \
+            | grep -viE 'Frameworks/(FridaGadget\.dylib|FridaGadget\.config|config\.json)' \
+            | grep -v "${EXEC_NAME}$" || true)"
+          [ -z "$FOREIGN" ] || { echo "остались чужие frida-записи:"; echo "$FOREIGN"; exit 1; }
+
+          echo "== load commands =="
+          otool -l "work/verify/$BIN_PATH" | grep -A3 LC_LOAD_DYLIB | grep -i frida \
+            || { echo "в бинаре нет LC_LOAD_DYLIB на FridaGadget"; exit 1; }
+          if otool -l "work/verify/$BIN_PATH" | grep -A3 LC_LOAD_DYLIB | grep -qi 'Frida\.framework'; then
+            echo "висячий LC_LOAD_DYLIB на Frida.framework остался"; exit 1
+          fi
+          otool -l "work/verify/$BIN_PATH" | grep -A2 LC_LOAD_DYLIB | grep -c 'name ' | sed 's/^/LC_LOAD_DYLIB всего: /'
+
+          echo "== гаджет =="
+          echo "версия: $GADGET_VERSION"
           python3 - <<'PY'
           import os, sys
-          b = 'out/FridaGadget.framework/FridaGadget'
-          cap = float('${{ inputs.max_mb }}')
-          n = os.path.getsize(b)
-          print('FridaGadget %d bytes = %.2f MB (cap %.2f MB)' % (n, n / 1048576.0, cap))
-          sys.exit(0 if n / 1048576.0 <= cap else 1)
+          p = 'work/verify/%s/Frameworks/FridaGadget.dylib' % os.environ['APP_ENTRY'].rstrip('/')
+          n = os.path.getsize(p)
+          print('FridaGadget %d bytes = %.2f MB' % (n, n / 1048576.0))
+          cap = float(os.environ['MAX_MB'])
+          if cap > 0 and n / 1048576.0 > cap:
+              print('больше лимита %.2f MB' % cap)
+              sys.exit(1)
           PY
+
+          echo "== подписи (ожидается adhoc) =="
+          codesign -dvvv "$APP_VERIFY/Frameworks/FridaGadget.dylib" 2>&1 | grep -E 'Identifier|Signature' || true
+          codesign -dvvv "$APP_VERIFY/$EXEC_NAME" 2>&1 | grep -E 'Identifier|Signature' || true
+          codesign -dvvv "$APP_VERIFY" 2>&1 | grep -E 'Identifier|Signature' || true
+
+          echo "== целостность =="
+          unzip -tq "$OUT_IPA" >/dev/null && echo "zip ok"
+          ls -l "$OUT_IPA"
+
+      - name: upload exec
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: exec
+          path: exe/*
+          compression-level: 0
+          if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: FridaGadget-${{ inputs.version }}
+          name: FridaGadget-${{ inputs.version || 'latest' }}-${{ github.run_number }}
           path: |
-            out/FridaGadget.framework
-            FridaGadget.framework.zip
-            gadget.dylib
+            out/*.ipa
+            work/gadget/FridaGadget.config
+            work/strip.log
+            work/probe
+          if-no-files-found: warn
           compression-level: 0
