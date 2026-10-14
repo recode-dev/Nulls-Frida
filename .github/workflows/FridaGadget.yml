@@ -27,6 +27,26 @@ jobs:
         with:
           node-version: "20"
 
+      - name: cert
+        run: |
+          security create-keychain -p "" ci.keychain
+          security set-keychain-settings -lut 21600 ci.keychain
+          security unlock-keychain -p "" ci.keychain
+          security list-keychains -d user -s ci.keychain $(security list-keychains -d user | tr -d ' "')
+          openssl req -x509 -newkey rsa:2048 -keyout ci.key -out ci.crt -days 2 -nodes -subj "/CN=FridaCI"
+          openssl pkcs12 -export -inkey ci.key -in ci.crt -out ci.p12 -passout pass: -name FridaCI
+          security import ci.p12 -k ci.keychain -P "" -T /usr/bin/codesign -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" ci.keychain >/dev/null
+          ID=$(security find-identity -v -p codesigning ci.keychain | awk '/FridaCI/ {print $2; exit}')
+          security find-identity -v -p codesigning ci.keychain
+          if [ -z "$ID" ]; then
+            echo "no codesigning identity"
+            exit 1
+          fi
+          echo "IOS_CERTID=$ID" >> "$GITHUB_ENV"
+          echo "MACOS_CERTID=$ID" >> "$GITHUB_ENV"
+          echo "cert id $ID"
+
       - name: source
         run: |
           git clone --depth 1 --branch "${{ inputs.version }}" https://github.com/frida/frida.git frida
@@ -35,27 +55,42 @@ jobs:
       - name: configure
         working-directory: frida
         run: |
-          if ! ./configure --host=ios-arm64 -- -Dfrida-gum:v8=disabled; then
-            echo "configure failed; frida-gum options:"
+          if ! ./configure --host=ios-arm64 -- \
+            -Dfrida-gum:v8=disabled \
+            -Dfrida-gum:database=disabled \
+            -Dfrida-gum:inspector=disabled \
+            -Dfrida-core:connectivity=disabled \
+            -Dfrida-core:socket_backend=disabled; then
+            echo "configure failed; options:"
             sed -n '1,140p' subprojects/frida-gum/meson.options || true
+            sed -n '1,140p' subprojects/frida-core/meson.options || true
             exit 1
           fi
 
       - name: make
         working-directory: frida
-        run: make
+        run: |
+          if ! make; then
+            echo "== cert related options:"
+            grep -rniE "certid|identity|codesign" subprojects/frida-core/meson.options subprojects/frida-core/meson.build 2>/dev/null | head -20 || true
+            exit 1
+          fi
 
       - name: gadget
         run: |
-          D=$(find frida/build -name "*gadget*.dylib" -type f | head -1)
-          if [ -z "$D" ]; then
-            echo "no gadget dylib produced; what the build made:"
+          CAND=""
+          for P in frida/build/lib/gadget/frida-gadget.dylib $(find frida/build -name "*gadget*.dylib" -type f 2>/dev/null); do
+            case "$P" in *arm64e*|*compat*) continue ;; esac
+            if [ -s "$P" ]; then CAND="$P"; break; fi
+          done
+          if [ -z "$CAND" ]; then
+            echo "no gadget dylib; what the build made:"
             find frida/build -name "*.dylib" -type f -exec ls -l {} \; | head -30
             find frida/build -maxdepth 6 -type d -name "*frida*" | head -20
             exit 1
           fi
-          echo "gadget: $D"
-          cp "$D" gadget.dylib
+          echo "gadget: $CAND"
+          cp "$CAND" gadget.dylib
           ls -l gadget.dylib
           lipo -archs gadget.dylib || true
 
@@ -141,14 +176,9 @@ jobs:
             ldid -S "$FW/FridaGadget"
             echo "signed: ldid"
           elif command -v codesign >/dev/null 2>&1; then
-            codesign -f -s - "$FW/FridaGadget"
-            echo "signed: codesign ad-hoc"
+            codesign -f -s - "$FW/FridaGadget" 2>/dev/null && echo "signed: codesign ad-hoc"
           else
             echo "warn: no ldid/codesign here"
-          fi
-
-          if command -v codesign >/dev/null 2>&1; then
-            codesign -f -s - "$FW/FridaGadget" 2>/dev/null && echo "signed: codesign ad-hoc"
           fi
           if command -v codesign >/dev/null 2>&1; then
             codesign -dvv "$FW/FridaGadget" 2>&1 | grep -E "Signature|Identifier|Format" || true
