@@ -28,24 +28,24 @@ jobs:
 
       - name: fetch
         run: |
-          python3 tools/ExecutablePatch_1.py --resolve "${{ inputs.url }}" | tee url.txt
+          python3 tools/ExecutablePatch.py --resolve "${{ inputs.url }}" | tee url.txt
           curl -sSL --max-time 900 -o nb.ipa "$(cat url.txt)"
           ls -l nb.ipa
 
       - name: patch
         run: |
-          python3 tools/ExecutablePatch_1.py --ipa nb.ipa --exe-dir exe ${{ inputs.drop_lc && '--drop-lc' || '' }} ${{ inputs.ipa && '--out nb_1.ipa' || '' }}
+          python3 tools/ExecutablePatch.py --ipa nb.ipa --exe-dir exe ${{ inputs.drop_lc && '--drop-lc' || '' }} ${{ inputs.ipa && '--out nb_patched.ipa' || '' }}
           ls -l exe
 
       - uses: actions/upload-artifact@v4
         with:
-          name: exec_1
+          name: exec
           path: exe/*
           compression-level: 0
 
       - if: inputs.ipa
         uses: actions/upload-artifact@v4
         with:
-          name: ipa_1
-          path: nb_1.ipa
+          name: ipa
+          path: nb_patched.ipa
           compression-level: 0

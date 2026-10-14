@@ -12,7 +12,6 @@ import zipfile
 
 FRIDA = "Frida.framework"
 ORPHAN = 0xFD
-SUFFIX = "_1"
 UA = {"User-Agent": "curl/8"}
 
 
@@ -142,7 +141,7 @@ def main():
     out = drop_lc(data, work) if a.drop_lc else data
 
     os.makedirs(a.exe_dir, exist_ok=True)
-    dst = os.path.join(a.exe_dir, os.path.basename(ex) + SUFFIX)
+    dst = os.path.join(a.exe_dir, os.path.basename(ex))
     open(dst, "wb").write(out)
     print("exec: %s (%d bytes)" % (dst, len(out)))
 
