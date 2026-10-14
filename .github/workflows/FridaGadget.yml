@@ -41,9 +41,20 @@ jobs:
           if ! ./configure --host=ios-arm64 -- \
             -Dfrida-gum:v8=disabled \
             -Dfrida-gum:database=disabled \
-            -Dfrida-gum:inspector=disabled \
+            -Dfrida-gum:diet=true \
+            -Dfrida-gum:graft_tool=disabled \
+            -Dfrida-gum:jailbreak=disabled \
+            -Dfrida-gum:tests=disabled \
             -Dfrida-core:connectivity=disabled \
-            -Dfrida-core:socket_backend=disabled; then
+            -Dfrida-core:apple_tls=disabled \
+            -Dfrida-core:socket_backend=disabled \
+            -Dfrida-core:compat=disabled \
+            -Dfrida-core:tests=disabled \
+            -Dfrida-core:server=disabled \
+            -Dfrida-core:portal=disabled \
+            -Dfrida-core:inject=disabled \
+            -Dfrida-core:gadget=enabled \
+            -Dfrida-core:assets=embedded; then
             echo "configure failed; options:"
             sed -n '1,140p' subprojects/frida-gum/meson.options || true
             sed -n '1,140p' subprojects/frida-core/meson.options || true
