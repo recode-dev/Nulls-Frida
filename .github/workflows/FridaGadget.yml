@@ -15,6 +15,18 @@ on:
       code_signing:
         description: gadget code_signing mode
         default: required
+      preset:
+        description: configure preset
+        type: choice
+        options:
+          - minimal
+          - vanilla
+          - trimmed
+          - nodiet
+        default: minimal
+      extra_flags:
+        description: extra -D flags
+        default: ""
 
 jobs:
   build:
@@ -48,30 +60,27 @@ jobs:
 
       - name: configure
         working-directory: frida
+        env:
+          PRESET: ${{ inputs.preset }}
+          EXTRA: ${{ inputs.extra_flags }}
         run: |
-          if ! ./configure --host=ios-arm64 -- \
-            -Dfrida-gum:v8=disabled \
-            -Dfrida-gum:database=disabled \
-            -Dfrida-gum:diet=true \
-            -Dfrida-gum:graft_tool=disabled \
-            -Dfrida-gum:jailbreak=disabled \
-            -Dfrida-gum:tests=disabled \
-            -Dfrida-core:connectivity=disabled \
-            -Dfrida-core:apple_tls=disabled \
-            -Dfrida-core:socket_backend=disabled \
-            -Dfrida-core:local_backend=disabled \
-            -Dfrida-core:simmy_backend=disabled \
-            -Dfrida-core:fruity_backend=disabled \
-            -Dfrida-core:droidy_backend=disabled \
-            -Dfrida-core:barebone_backend=disabled \
-            -Dfrida-core:compiler_backend=disabled \
-            -Dfrida-core:compat=disabled \
-            -Dfrida-core:tests=disabled \
-            -Dfrida-core:server=disabled \
-            -Dfrida-core:portal=disabled \
-            -Dfrida-core:inject=disabled \
-            -Dfrida-core:gadget=enabled \
-            -Dfrida-core:assets=embedded; then
+          case "$PRESET" in
+            vanilla)
+              FLAGS="-Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled"
+              ;;
+            nodiet)
+              FLAGS="-Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-gum:graft_tool=disabled -Dfrida-gum:jailbreak=disabled -Dfrida-gum:tests=disabled -Dfrida-core:connectivity=disabled -Dfrida-core:apple_tls=disabled -Dfrida-core:socket_backend=disabled -Dfrida-core:local_backend=disabled -Dfrida-core:simmy_backend=disabled -Dfrida-core:fruity_backend=disabled -Dfrida-core:droidy_backend=disabled -Dfrida-core:barebone_backend=disabled -Dfrida-core:compiler_backend=disabled -Dfrida-core:compat=disabled -Dfrida-core:tests=disabled -Dfrida-core:server=disabled -Dfrida-core:portal=disabled -Dfrida-core:inject=disabled -Dfrida-core:gadget=enabled -Dfrida-core:assets=embedded"
+              ;;
+            trimmed)
+              FLAGS="-Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-gum:diet=true -Dfrida-gum:graft_tool=disabled -Dfrida-gum:jailbreak=disabled -Dfrida-gum:tests=disabled -Dfrida-core:connectivity=disabled -Dfrida-core:apple_tls=disabled -Dfrida-core:socket_backend=disabled -Dfrida-core:local_backend=disabled -Dfrida-core:simmy_backend=disabled -Dfrida-core:fruity_backend=disabled -Dfrida-core:droidy_backend=disabled -Dfrida-core:barebone_backend=disabled -Dfrida-core:compiler_backend=disabled -Dfrida-core:compat=disabled -Dfrida-core:tests=disabled -Dfrida-core:server=disabled -Dfrida-core:portal=disabled -Dfrida-core:inject=disabled -Dfrida-core:gadget=enabled -Dfrida-core:assets=embedded"
+              ;;
+            *)
+              FLAGS="-Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-core:connectivity=disabled -Dfrida-core:socket_backend=disabled -Dfrida-core:compat=disabled"
+              ;;
+          esac
+          echo "preset $PRESET"
+          echo "flags $FLAGS $EXTRA"
+          if ! ./configure --host=ios-arm64 -- $FLAGS $EXTRA; then
             echo "configure failed; options:"
             sed -n '1,140p' subprojects/frida-gum/meson.options || true
             sed -n '1,140p' subprojects/frida-core/meson.options || true
@@ -109,28 +118,6 @@ jobs:
           echo "== openssl/lzfse strings"
           strings -a gadget.dylib | grep -ciE "openssl|libcrypto" || true
           strings -a gadget.dylib | grep -ci "lzfse" || true
-
-      - name: bytecode
-        run: |
-          Q=$(find frida/build -name quickcompile -type f | head -1)
-          if [ -z "$Q" ]; then
-            echo "no quickcompile in the build"
-            find frida/build -name "*quickcompile*" | head
-            exit 1
-          fi
-          echo "quickcompile: $Q"
-          mkdir -p bc_in bc_out
-          cat > bc_in/agent.js <<'JS'
-          const m = Process.getModuleByName(Process.mainModule.name);
-          console.log('[agent] ' + m.name + ' @ ' + m.base);
-          setInterval(function () {}, 1000);
-          JS
-          "$Q" bc_out bc_in bc_in/agent.js
-          ls -l bc_out
-          for f in bc_out/*; do
-            echo "== $f"
-            xxd "$f" | head -6
-          done
 
       - name: framework
         env:
@@ -250,5 +237,4 @@ jobs:
             out/FridaGadget.framework
             FridaGadget.framework.zip
             gadget.dylib
-            bc_out/*
           compression-level: 0
