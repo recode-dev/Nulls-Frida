@@ -21,10 +21,13 @@ on:
         description: упасть, если dylib гаджета в итоговом IPA больше, МБ (0 = не проверять)
         default: "40"
       script:
-        description: имя JS рядом с конфигом (это же имя идёт в "path" конфига)
+        description: имя JS-файла в бандле (это же имя идёт в "path" конфига)
         default: "agent.js"
       script_file:
         description: "необязательно: путь к .js в репозитории, который вшить в бандл"
+        default: ""
+      script_dir:
+        description: "папка скрипта внутри .app: пусто = корень .app, Frameworks = рядом с dylib"
         default: ""
       code_signing:
         description: режим code_signing в конфиге гаджета
@@ -42,6 +45,7 @@ jobs:
       MAX_MB: ${{ inputs.max_mb }}
       SCRIPT_NAME: ${{ inputs.script }}
       SCRIPT_FILE: ${{ inputs.script_file }}
+      SCRIPT_DIR: ${{ inputs.script_dir }}
       CODE_SIGNING: ${{ inputs.code_signing }}
 
     steps:
@@ -125,11 +129,28 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work/gadget
+          DIR="${SCRIPT_DIR:-}"
+          DIR="${DIR#/}"
+          DIR="${DIR%/}"
+          case "$DIR" in
+            ""|".")
+              PATH_VALUE="../$SCRIPT_NAME"
+              DIR=""
+              ;;
+            Frameworks)
+              PATH_VALUE="$SCRIPT_NAME"
+              ;;
+            *)
+              PATH_VALUE="../$DIR/$SCRIPT_NAME"
+              ;;
+          esac
+          echo "скрипт: ${DIR:-<корень .app>} | path в конфиге: $PATH_VALUE"
+          echo "SCRIPT_DIR_NORM=$DIR" >> "$GITHUB_ENV"
           cat > work/gadget/FridaGadget.config <<CFG
           {
             "interaction": {
               "type": "script",
-              "path": "$SCRIPT_NAME",
+              "path": "$PATH_VALUE",
               "on_change": "reload",
               "parameters": {}
             },
@@ -207,8 +228,11 @@ jobs:
 
           script_src = os.path.join('work', 'gadget', script_name)
           if os.path.exists(script_src):
-              shutil.copyfile(script_src, os.path.join(frameworks, script_name))
-              print('вшит скрипт:', script_name)
+              script_dir = (os.environ.get('SCRIPT_DIR') or '').strip().strip('/')
+              target_dir = app if script_dir in ('', '.') else os.path.join(app, script_dir)
+              os.makedirs(target_dir, exist_ok=True)
+              shutil.copyfile(script_src, os.path.join(target_dir, script_name))
+              print('вшит скрипт:', os.path.relpath(os.path.join(target_dir, script_name), app))
 
           dest = os.path.join('work', 'patched-app', os.path.basename(app))
           shutil.rmtree(dest, ignore_errors=True)
@@ -222,7 +246,7 @@ jobs:
           print('inject ok ->', dest)
           PY
 
-          ls -la "$PATCHED_APP_DIR/Frameworks"
+          ls -la "$PATCHED_APP_DIR" "$PATCHED_APP_DIR/Frameworks"
 
       - name: ad-hoc sign and pack
         run: |
@@ -274,7 +298,13 @@ jobs:
             [ -f "$APP_VERIFY/$f" ] || { echo "в патченом IPA нет $f"; exit 1; }
           done
           if [ -n "$SCRIPT_FILE" ]; then
-            [ -f "$APP_VERIFY/Frameworks/$SCRIPT_NAME" ] || { echo "в патченом IPA нет скрипта $SCRIPT_NAME"; exit 1; }
+            if [ -n "$SCRIPT_DIR_NORM" ]; then
+              SCRIPT_IN_IPA="$APP_VERIFY/$SCRIPT_DIR_NORM/$SCRIPT_NAME"
+            else
+              SCRIPT_IN_IPA="$APP_VERIFY/$SCRIPT_NAME"
+            fi
+            [ -f "$SCRIPT_IN_IPA" ] || { echo "в патченом IPA нет скрипта $SCRIPT_IN_IPA"; exit 1; }
+            echo "скрипт в IPA: ${SCRIPT_IN_IPA#$APP_VERIFY/}"
           fi
 
           echo "== frida-записи в итоговом IPA (должны быть только наши) =="
@@ -284,7 +314,8 @@ jobs:
           fi
           FOREIGN="$(unzip -Z1 "$OUT_IPA" | grep -i frida \
             | grep -viE 'Frameworks/(FridaGadget\.dylib|FridaGadget\.config|config\.json)' \
-            | grep -v "${EXEC_NAME}$" || true)"
+            | grep -v "${EXEC_NAME}$" \
+            | grep -v "${SCRIPT_NAME}$" || true)"
           [ -z "$FOREIGN" ] || { echo "остались чужие frida-записи:"; echo "$FOREIGN"; exit 1; }
 
           echo "== load commands =="
