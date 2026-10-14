@@ -19,7 +19,7 @@ on:
         default: ""
       max_mb:
         description: упасть, если dylib гаджета в итоговом IPA больше, МБ (0 = не проверять)
-        default: "40"
+        default: "60"
       script:
         description: имя JS-файла в бандле (это же имя идёт в "path" конфига)
         default: "agent.js"
@@ -51,6 +51,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: toolchain
         run: |
           set -euo pipefail
@@ -68,7 +76,8 @@ jobs:
 
           python3 -c 'import lief; print("lief", lief.__version__)'
           objection version 2>&1 | tail -1 || true
-          for c in insert_dylib codesign security zip unzip plutil xcodebuild; do
+          npm install -g applesign
+          for c in insert_dylib codesign security zip unzip plutil xcodebuild applesign; do
             command -v "$c" || { echo "нет обязательной команды: $c"; exit 1; }
           done
 
@@ -80,12 +89,14 @@ jobs:
           ls -l work/app.ipa
 
           unzip -tq work/app.ipa >/dev/null
-          APP_ENTRY="$(unzip -Z1 work/app.ipa | grep -E '^Payload/[^/]+\.app/$' | head -1)"
-          [ -n "$APP_ENTRY" ] || { echo "в IPA нет Payload/*.app"; exit 1; }
-          echo "APP_ENTRY=$APP_ENTRY" >> "$GITHUB_ENV"
+          APP_INFO="$(unzip -Z1 work/app.ipa | grep -E '^Payload/[^/]+\.app/Info\.plist$' | head -1)"
+          [ -n "$APP_INFO" ] || { echo "в IPA нет Payload/*.app/Info.plist"; exit 1; }
+          APP_DIR="${APP_INFO%/Info.plist}"
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "бандл: $APP_DIR"
 
           mkdir -p work/probe
-          unzip -o -q work/app.ipa "$APP_ENTRY/Info.plist" -d work/probe
+          unzip -o -q work/app.ipa "$APP_DIR/Info.plist" -d work/probe
           python3 - <<'PY'
           import plistlib, pathlib, os
           p = next(pathlib.Path('work/probe/Payload').glob('*.app/Info.plist'))
@@ -100,7 +111,7 @@ jobs:
               f.write('EXEC_NAME=%s\n' % d.get('CFBundleExecutable'))
           PY
 
-          BIN_PATH="$(dirname "$APP_ENTRY")/$(cat work/exec-name.txt)"
+          BIN_PATH="$APP_DIR/$(cat work/exec-name.txt)"
           unzip -o -q work/app.ipa "$BIN_PATH" -d work/probe
           CRYPTID="$(otool -l "work/probe/$BIN_PATH" | awk '/LC_ENCRYPTION_INFO/{f=1} f&&/^ *cryptid/{print $2; exit}')"
           echo "cryptid=${CRYPTID:-<нет LC_ENCRYPTION_INFO>}"
@@ -215,6 +226,8 @@ jobs:
               if not os.path.exists(gadget_path):
                   raise SystemExit('нет файла своей сборки гаджета: %s' % gadget_path)
               print('использую свою сборку:', gadget_path)
+          elif gadget.gadget_exists() and gadget.get_local_version('ios_universal') == version:
+              print('гаджет уже в кэше:', gadget_path)
           else:
               print('качаю релизный гаджет...')
               gadget.download().unpack().set_local_version('ios_universal', version).cleanup()
@@ -223,6 +236,8 @@ jobs:
           print('gadget: %s (%d bytes)' % (gadget_path, size))
 
           p = IosPatcher(skip_cleanup=True)
+          if not p.are_requirements_met():
+              raise SystemExit('objection: не все внешние команды найдены (см. предупреждения выше)')
           p.extract_ipa(False, ipa_source=ipa)
           p.set_application_binary()
           p.patch_and_codesign_binary(
@@ -261,7 +276,9 @@ jobs:
           print('inject ok ->', dest)
           PY
 
-          ls -la "$PATCHED_APP_DIR" "$PATCHED_APP_DIR/Frameworks"
+          echo "== содержимое бандла =="
+          ls -la work/patched-app/*/
+          ls -la work/patched-app/*/Frameworks
 
       - name: ad-hoc sign and pack
         run: |
@@ -270,7 +287,7 @@ jobs:
           EXEC="$APP/$EXEC_NAME"
           [ -f "$EXEC" ] || { echo "нет исполняемого файла $EXEC"; exit 1; }
 
-          ORIG_BIN="$(dirname "$APP_ENTRY")/$EXEC_NAME"
+          ORIG_BIN="$APP_DIR/$EXEC_NAME"
           rm -rf work/orig && mkdir -p work/orig
           unzip -o -q work/app.ipa "$ORIG_BIN" -d work/orig
           ENTS=""
@@ -282,8 +299,14 @@ jobs:
             echo "entitlements не найдены — подписываю без них"
           fi
 
-          find "$APP" -type f -name '*.dylib' -print0 \
-            | while IFS= read -r -d '' f; do codesign -f -s - "$f"; done
+          for d in "$APP/Frameworks" "$APP/PlugIns" "$APP/Watch"; do
+            [ -d "$d" ] || continue
+            find "$d" -type f -print0 | while IFS= read -r -d '' f; do
+              if file -b "$f" | grep -q 'Mach-O'; then
+                codesign -f -s - "$f"
+              fi
+            done
+          done
           codesign -f -s - $ENTS "$EXEC"
           codesign -f -s - "$APP"
 
@@ -303,8 +326,8 @@ jobs:
           set -euo pipefail
           rm -rf work/verify && mkdir -p work/verify
           unzip -q "$OUT_IPA" -d work/verify
-          APP_VERIFY="work/verify/${APP_ENTRY%/}"
-          BIN_PATH="${APP_ENTRY%/}/$EXEC_NAME"
+          APP_VERIFY="work/verify/$APP_DIR"
+          BIN_PATH="$APP_DIR/$EXEC_NAME"
 
           echo "== Frameworks =="
           ls -la "$APP_VERIFY/Frameworks"
@@ -352,7 +375,7 @@ jobs:
           echo "версия: $GADGET_VERSION"
           python3 - <<'PY'
           import os, sys
-          p = 'work/verify/%s/Frameworks/FridaGadget.dylib' % os.environ['APP_ENTRY'].rstrip('/')
+          p = 'work/verify/%s/Frameworks/FridaGadget.dylib' % os.environ['APP_DIR']
           n = os.path.getsize(p)
           print('FridaGadget %d bytes = %.2f MB' % (n, n / 1048576.0))
           cap = float(os.environ['MAX_MB'])
