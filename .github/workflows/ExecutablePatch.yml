@@ -1,0 +1,51 @@
+name: ExecutablePatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: ipa endpoint
+        required: false
+        default: https://nulls.ee/bs_latest_i
+      drop_lc:
+        description: cut the dangling Frida load command (ordinals fixed)
+        type: boolean
+        default: false
+      ipa:
+        description: also repack the whole ipa
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install lief && sudo apt-get install -y zip
+
+      - name: fetch
+        run: |
+          python3 tools/ExecutablePatch.py --resolve "${{ inputs.url }}" | tee url.txt
+          curl -sSL --max-time 900 -o nb.ipa "$(cat url.txt)"
+          ls -l nb.ipa
+
+      - name: patch
+        run: |
+          python3 tools/ExecutablePatch.py --ipa nb.ipa --exe-dir exe ${{ inputs.drop_lc && '--drop-lc' || '' }} ${{ inputs.ipa && '--out nb_1.ipa' || '' }}
+          ls -l exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exec_1
+          path: exe/*
+          compression-level: 0
+
+      - if: inputs.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa_1
+          path: nb_1.ipa
+          compression-level: 0
