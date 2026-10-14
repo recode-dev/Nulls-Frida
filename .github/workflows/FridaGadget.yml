@@ -1,1 +1,184 @@
+name: FridaGadget
 
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: frida tag
+        default: "17.23.3"
+      max_mb:
+        description: fail if the framework binary is bigger
+        default: "5"
+      script:
+        description: gadget script path inside the app
+        default: agent.js
+      code_signing:
+        description: gadget code_signing mode
+        default: required
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: source
+        run: |
+          git clone --depth 1 --branch "${{ inputs.version }}" https://github.com/frida/frida.git frida
+          git -C frida log --oneline -1
+
+      - name: configure
+        working-directory: frida
+        run: |
+          if ! ./configure --host=ios-arm64 -- -Dfrida-gum:v8=disabled; then
+            echo "configure failed; frida-gum options:"
+            sed -n '1,140p' subprojects/frida-gum/meson.options || true
+            exit 1
+          fi
+
+      - name: make
+        working-directory: frida
+        run: make
+
+      - name: gadget
+        run: |
+          D=$(find frida/build -name "*gadget*.dylib" -type f | head -1)
+          if [ -z "$D" ]; then
+            echo "no gadget dylib produced; what the build made:"
+            find frida/build -name "*.dylib" -type f -exec ls -l {} \; | head -30
+            find frida/build -maxdepth 6 -type d -name "*frida*" | head -20
+            exit 1
+          fi
+          echo "gadget: $D"
+          cp "$D" gadget.dylib
+          ls -l gadget.dylib
+          lipo -archs gadget.dylib || true
+
+      - name: framework
+        env:
+          FRIDA_VERSION: ${{ inputs.version }}
+          SCRIPT_PATH: ${{ inputs.script }}
+          CODE_SIGNING: ${{ inputs.code_signing }}
+          ARCH: arm64
+        run: |
+          if [ ! -f gadget/mkfw.sh ]; then
+            mkdir -p gadget
+            cat > gadget/mkfw.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          DYLIB=${1:?usage: mkfw.sh <gadget.dylib> [outdir]}
+          OUT=${2:-.}
+          VER=${FRIDA_VERSION:-unknown}
+          SCRIPT=${SCRIPT_PATH:-agent.js}
+          CS=${CODE_SIGNING:-required}
+          ARCH=${ARCH:-arm64}
+          FW="$OUT/FridaGadget.framework"
+          ID='@executable_path/Frameworks/FridaGadget.framework/FridaGadget'
+
+          rm -rf "$FW"
+          mkdir -p "$FW"
+          cp "$DYLIB" "$FW/FridaGadget"
+          chmod 755 "$FW/FridaGadget"
+
+          if command -v lipo >/dev/null 2>&1; then
+            ARCHS=$(lipo -archs "$FW/FridaGadget" 2>/dev/null || echo "")
+            case "$ARCHS" in
+              *" "*)
+                lipo -thin "$ARCH" "$FW/FridaGadget" -output "$FW/FridaGadget.thin"
+                mv "$FW/FridaGadget.thin" "$FW/FridaGadget"
+                echo "thin: $ARCH (was: $ARCHS)"
+                ;;
+              *) echo "arch: $ARCHS" ;;
+            esac
+          fi
+
+          cat > "$FW/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>FridaGadget</string>
+              <key>CFBundleIdentifier</key>
+              <string>re.frida.gadget</string>
+              <key>CFBundleName</key>
+              <string>FridaGadget</string>
+              <key>CFBundlePackageType</key>
+              <string>FMWK</string>
+              <key>CFBundleShortVersionString</key>
+              <string>$VER</string>
+              <key>CFBundleVersion</key>
+              <string>$VER</string>
+              <key>MinimumOSVersion</key>
+              <string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+
+          cat > "$FW/FridaGadget.config" <<CFG
+          {
+            "interaction": {
+              "type": "script",
+              "path": "$SCRIPT",
+              "on_change": "reload"
+            },
+            "code_signing": "$CS"
+          }
+          CFG
+
+          if command -v install_name_tool >/dev/null 2>&1; then
+            install_name_tool -id "$ID" "$FW/FridaGadget"
+            echo "id -> $ID"
+          fi
+
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S "$FW/FridaGadget"
+            echo "signed: ldid"
+          elif command -v codesign >/dev/null 2>&1; then
+            codesign -f -s - "$FW/FridaGadget"
+            echo "signed: codesign ad-hoc"
+          else
+            echo "warn: no ldid/codesign here"
+          fi
+
+          if command -v codesign >/dev/null 2>&1; then
+            codesign -f -s - "$FW/FridaGadget" 2>/dev/null && echo "signed: codesign ad-hoc"
+          fi
+          if command -v codesign >/dev/null 2>&1; then
+            codesign -dvv "$FW/FridaGadget" 2>&1 | grep -E "Signature|Identifier|Format" || true
+          fi
+
+          ls -la "$FW"
+          EOF
+            chmod +x gadget/mkfw.sh
+            echo "wrote gadget/mkfw.sh"
+          fi
+          bash gadget/mkfw.sh gadget.dylib out
+          (cd out && zip -qry ../FridaGadget.framework.zip FridaGadget.framework)
+          ls -l out/FridaGadget.framework FridaGadget.framework.zip
+
+      - name: size
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          b = 'out/FridaGadget.framework/FridaGadget'
+          cap = float('${{ inputs.max_mb }}')
+          n = os.path.getsize(b)
+          print('FridaGadget %d bytes = %.2f MB (cap %.2f MB)' % (n, n / 1048576.0, cap))
+          sys.exit(0 if n / 1048576.0 <= cap else 1)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FridaGadget-${{ inputs.version }}
+          path: |
+            out/FridaGadget.framework
+            FridaGadget.framework.zip
+            gadget.dylib
+          compression-level: 0
