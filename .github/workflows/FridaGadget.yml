@@ -1,21 +1,5 @@
 name: FridaGadget
 
-# Вшивание своего Frida Gadget в IPA вместо гаджета разработчика IPA.
-#
-# Пайплайн:
-#   1. tools/ExecutablePatch.py --resolve   -> прямая ссылка на .ipa
-#   2. tools/ExecutablePatch.py --drop-lc   -> из бандла вырезается dev-овский
-#      Frida.framework и висячий LC_LOAD_DYLIB (с починкой ordinal'ов в chained fixups)
-#   3. objection (IosGadget/IosPatcher)     -> вшивается наш dylib + конфиг
-#   4. ad-hoc подпись (codesign -s -)       -> без сертификата Apple
-#
-# Почему не `objection patchipa`: он требует --codesign-signature (required=True),
-# не имеет флага "не подписывать" и внутри всегда зовёт applesign с --mobileprovision.
-# Без сертификата и профиля этот путь не проходит, поэтому вызываются те же классы
-# objection напрямую, а пересборка IPA и ad-hoc подпись делаются вручную.
-#
-# Секреты не нужны. Версия гаджета и ссылка на IPA определяются сами.
-
 on:
   workflow_dispatch:
     inputs:
@@ -68,7 +52,6 @@ jobs:
           set -euo pipefail
           mkdir -p work out
 
-          # lief нужен tools/ExecutablePatch.py, insert_dylib — objection
           python3 -m pip install --quiet --upgrade pip
           python3 -m pip install --quiet lief "objection==${OBJECTION_VERSION}"
 
@@ -92,13 +75,11 @@ jobs:
           curl -fL --retry 3 --retry-delay 5 --max-time 900 -o work/app.ipa "$(tail -1 work/url.txt)"
           ls -l work/app.ipa
 
-          # проверки: это zip и внутри Payload/*.app
           unzip -tq work/app.ipa >/dev/null
           APP_ENTRY="$(unzip -Z1 work/app.ipa | grep -E '^Payload/[^/]+\.app/$' | head -1)"
           [ -n "$APP_ENTRY" ] || { echo "в IPA нет Payload/*.app"; exit 1; }
           echo "APP_ENTRY=$APP_ENTRY" >> "$GITHUB_ENV"
 
-          # метаданные бандла и проверка FairPlay
           mkdir -p work/probe
           unzip -o -q work/app.ipa "$APP_ENTRY/Info.plist" -d work/probe
           python3 - <<'PY'
@@ -115,7 +96,6 @@ jobs:
               f.write('EXEC_NAME=%s\n' % d.get('CFBundleExecutable'))
           PY
 
-          # GITHUB_ENV виден только следующим шагам, поэтому имя бинаря читаем из файла
           BIN_PATH="$(dirname "$APP_ENTRY")/$(cat work/exec-name.txt)"
           unzip -o -q work/app.ipa "$BIN_PATH" -d work/probe
           CRYPTID="$(otool -l "work/probe/$BIN_PATH" | awk '/LC_ENCRYPTION_INFO/{f=1} f&&/^ *cryptid/{print $2; exit}')"
@@ -126,7 +106,6 @@ jobs:
             exit 1
           fi
 
-          # что вообще лежит от разработчика
           echo "== frida-записи в исходном IPA =="
           unzip -Z1 work/app.ipa | grep -i frida | sed -n '1,20p' || echo "(нет)"
 
@@ -195,7 +174,6 @@ jobs:
           want = (os.environ.get('FRIDA_VERSION') or '').strip()
           custom = (os.environ.get('CUSTOM_GADGET_URL') or '').strip()
 
-          # версия: из инпута либо последний релиз Frida
           gh = Github()
           version = want or gh.get_latest_version()
           print('frida release:', version)
@@ -214,8 +192,6 @@ jobs:
           size = os.path.getsize(gadget_path)
           print('gadget: %s (%d bytes)' % (gadget_path, size))
 
-          # injection: распаковка, выбор бинаря из Info.plist, вставка dylib,
-          # подпись всех dylib ad-hoc (identity '-')
           p = IosPatcher(skip_cleanup=True)
           p.extract_ipa(False, ipa_source=ipa)
           p.set_application_binary()
@@ -227,7 +203,6 @@ jobs:
           app = p.app_folder
           frameworks = os.path.join(app, 'Frameworks')
 
-          # второй экземпляр конфига: на устройстве читался только config.json
           shutil.copyfile(cfg, os.path.join(frameworks, 'config.json'))
 
           script_src = os.path.join('work', 'gadget', script_name)
@@ -235,7 +210,6 @@ jobs:
               shutil.copyfile(script_src, os.path.join(frameworks, script_name))
               print('вшит скрипт:', script_name)
 
-          # забираем бандл из системного temp в рабочую папку
           dest = os.path.join('work', 'patched-app', os.path.basename(app))
           shutil.rmtree(dest, ignore_errors=True)
           shutil.copytree(app, dest, symlinks=True)
@@ -257,7 +231,6 @@ jobs:
           EXEC="$APP/$EXEC_NAME"
           [ -f "$EXEC" ] || { echo "нет исполняемого файла $EXEC"; exit 1; }
 
-          # entitlements оригинала, если они вообще есть
           ORIG_BIN="$(dirname "$APP_ENTRY")/$EXEC_NAME"
           rm -rf work/orig && mkdir -p work/orig
           unzip -o -q work/app.ipa "$ORIG_BIN" -d work/orig
@@ -270,10 +243,8 @@ jobs:
             echo "entitlements не найдены — подписываю без них"
           fi
 
-          # ad-hoc: сначала все dylib, потом бинарь, потом сам бандл
           find "$APP" -type f -name '*.dylib' -print0 \
             | while IFS= read -r -d '' f; do codesign -f -s - "$f"; done
-          # shellcheck disable=SC2086
           codesign -f -s - $ENTS "$EXEC"
           codesign -f -s - "$APP"
 
@@ -281,7 +252,6 @@ jobs:
           codesign -dvv "$EXEC" 2>&1 | grep -E 'Identifier|Signature' || true
           codesign -dvv "$APP" 2>&1 | grep -E 'Identifier|Signature' || true
 
-          # сборка IPA: Payload/<App>.app
           rm -rf work/build && mkdir -p work/build/Payload
           cp -R "$APP" work/build/Payload/
           OUT="$GITHUB_WORKSPACE/out/$(basename "${APP%.app}")-frida.ipa"
