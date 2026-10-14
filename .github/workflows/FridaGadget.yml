@@ -20,32 +20,15 @@ jobs:
   build:
     runs-on: macos-14
     timeout-minutes: 180
+    env:
+      IOS_CERTID: "-"
+      MACOS_CERTID: "-"
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: cert
-        run: |
-          security create-keychain -p "" ci.keychain
-          security set-keychain-settings -lut 21600 ci.keychain
-          security unlock-keychain -p "" ci.keychain
-          security list-keychains -d user -s ci.keychain $(security list-keychains -d user | tr -d ' "')
-          openssl req -x509 -newkey rsa:2048 -keyout ci.key -out ci.crt -days 2 -nodes -subj "/CN=FridaCI"
-          openssl pkcs12 -export -inkey ci.key -in ci.crt -out ci.p12 -passout pass: -name FridaCI
-          security import ci.p12 -k ci.keychain -P "" -T /usr/bin/codesign -A
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" ci.keychain >/dev/null
-          ID=$(security find-identity -v -p codesigning ci.keychain | awk '/FridaCI/ {print $2; exit}')
-          security find-identity -v -p codesigning ci.keychain
-          if [ -z "$ID" ]; then
-            echo "no codesigning identity"
-            exit 1
-          fi
-          echo "IOS_CERTID=$ID" >> "$GITHUB_ENV"
-          echo "MACOS_CERTID=$ID" >> "$GITHUB_ENV"
-          echo "cert id $ID"
 
       - name: source
         run: |
