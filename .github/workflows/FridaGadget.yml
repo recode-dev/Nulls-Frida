@@ -110,6 +110,28 @@ jobs:
           strings -a gadget.dylib | grep -ciE "openssl|libcrypto" || true
           strings -a gadget.dylib | grep -ci "lzfse" || true
 
+      - name: bytecode
+        run: |
+          Q=$(find frida/build -name quickcompile -type f | head -1)
+          if [ -z "$Q" ]; then
+            echo "no quickcompile in the build"
+            find frida/build -name "*quickcompile*" | head
+            exit 1
+          fi
+          echo "quickcompile: $Q"
+          mkdir -p bc_in bc_out
+          cat > bc_in/agent.js <<'JS'
+          const m = Process.getModuleByName(Process.mainModule.name);
+          console.log('[agent] ' + m.name + ' @ ' + m.base);
+          setInterval(function () {}, 1000);
+          JS
+          "$Q" bc_out bc_in bc_in/agent.js
+          ls -l bc_out
+          for f in bc_out/*; do
+            echo "== $f"
+            xxd "$f" | head -6
+          done
+
       - name: framework
         env:
           FRIDA_VERSION: ${{ inputs.version }}
@@ -221,10 +243,12 @@ jobs:
           PY
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: FridaGadget-${{ inputs.version }}
           path: |
             out/FridaGadget.framework
             FridaGadget.framework.zip
             gadget.dylib
+            bc_out/*
           compression-level: 0
