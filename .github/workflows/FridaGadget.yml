@@ -14,8 +14,14 @@ on:
         description: вырезать загрузку Frida.framework разработчика IPA
         type: boolean
         default: true
+      gadget_name:
+        description: "имя файла гаджета в бандле; конфиг получит то же имя со .config"
+        default: "Recoil.dylib"
+      gadget_framework:
+        description: "имя фреймворка в Frameworks; пусто = <имя гаджета без .dylib>.framework"
+        default: ""
       custom_gadget_url:
-        description: "необязательно: URL своей сборки FridaGadget.dylib (релизная не качается)"
+        description: "необязательно: URL своей сборки гаджета (релизная не качается)"
         default: ""
       max_mb:
         description: упасть, если dylib гаджета в итоговом IPA больше, МБ (0 = не проверять)
@@ -48,6 +54,8 @@ jobs:
       SCRIPT_FILE: ${{ inputs.script_file }}
       SCRIPT_DIR: ${{ inputs.script_dir }}
       CODE_SIGNING: ${{ inputs.code_signing }}
+      GADGET_NAME: ${{ inputs.gadget_name }}
+      GADGET_FRAMEWORK: ${{ inputs.gadget_framework }}
 
     steps:
       - uses: actions/checkout@v4
@@ -143,6 +151,37 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work/gadget
+
+          # имя гаджета задаёт и имя его конфига: гаджет ищет <stem>.config рядом с собой,
+          # если он лежит отдельным dylib, а не внутри .framework
+          GN="${GADGET_NAME:-Recoil.dylib}"
+          case "$GN" in
+            *.dylib) ;;
+            *) echo "имя гаджета должно оканчиваться на .dylib: $GN"; exit 1 ;;
+          esac
+          STEM="${GN%.dylib}"
+          printf '%s' "$STEM" | grep -Eq '^[A-Za-z0-9_.-]+$' \
+            || { echo "недопустимые символы в имени гаджета: $GN"; exit 1; }
+          echo "GADGET_DYLIB=$GN" >> "$GITHUB_ENV"
+          echo "GADGET_STEM=$STEM" >> "$GITHUB_ENV"
+          echo "гаджет: $GN (конфиг: $STEM.config)"
+
+          # гаджет лежит не голым dylib, а внутри фреймворка (как Frida.framework/W.dylib
+          # в app разработчика), поэтому имя фреймворка задаётся отдельно
+          FWN="${GADGET_FRAMEWORK:-$STEM.framework}"
+          case "$FWN" in
+            *.framework) ;;
+            *) echo "имя фреймворка должно оканчиваться на .framework: $FWN"; exit 1 ;;
+          esac
+          FW_STEM="${FWN%.framework}"
+          [ -n "$FW_STEM" ] || { echo "пустое имя фреймворка: $FWN"; exit 1; }
+          printf '%s' "$FW_STEM" | grep -Eq '^[A-Za-z0-9_-]+$' \
+            || { echo "недопустимые символы в имени фреймворка: $FWN"; exit 1; }
+          FW_ID="com.$(printf '%s' "$FW_STEM" | tr '[:upper:]' '[:lower:]')"
+          echo "GADGET_FRAMEWORK=$FWN" >> "$GITHUB_ENV"
+          echo "GADGET_FW_STEM=$FW_STEM" >> "$GITHUB_ENV"
+          echo "фреймворк: $FWN -> Frameworks/$FWN/$GN"
+
           DIR="${SCRIPT_DIR:-Documents}"
           DIR="${DIR#/}"
           DIR="${DIR%/}"
@@ -169,7 +208,7 @@ jobs:
           echo "скрипт: $DIR | path в конфиге: $PATH_VALUE | вшивается в IPA: $EMBED"
           echo "SCRIPT_DIR_NORM=$DIR" >> "$GITHUB_ENV"
           echo "SCRIPT_EMBED=$EMBED" >> "$GITHUB_ENV"
-          cat > work/gadget/FridaGadget.config <<CFG
+          cat > "work/gadget/$STEM.config" <<CFG
           {
             "interaction": {
               "type": "script",
@@ -180,12 +219,49 @@ jobs:
             "code_signing": "$CODE_SIGNING"
           }
           CFG
-          cat work/gadget/FridaGadget.config
+          cat "work/gadget/$STEM.config"
+          cp "work/gadget/$STEM.config" work/gadget/config.json
+
+          # внутри .framework гаджет берёт конфиг как config.json рядом с собой,
+          # а рядом с самим бинарём ждёт <имя без .dylib>.config — кладём оба
+          cat > "work/gadget/$FW_STEM.Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>$GN</string>
+              <key>CFBundleIdentifier</key>
+              <string>$FW_ID</string>
+              <key>CFBundleName</key>
+              <string>$FW_STEM</string>
+              <key>CFBundlePackageType</key>
+              <string>FMWK</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>CFBundleSupportedPlatforms</key>
+              <array>
+                  <string>iPhoneOS</string>
+              </array>
+              <key>MinimumOSVersion</key>
+              <string>13.0</string>
+          </dict>
+          </plist>
+          PLIST
+          python3 -c "import plistlib,sys; plistlib.load(open(sys.argv[1],'rb'))" "work/gadget/$FW_STEM.Info.plist"
+          echo "фреймворк $FWN укомплектован: $GN, $STEM.config, config.json, Info.plist"
 
           if [ -n "$SCRIPT_FILE" ]; then
             [ -f "$SCRIPT_FILE" ] || { echo "нет файла скрипта: $SCRIPT_FILE"; exit 1; }
             cp "$SCRIPT_FILE" "work/gadget/$SCRIPT_NAME"
             ls -l "work/gadget/$SCRIPT_NAME"
+          elif [ "$EMBED" = "1" ]; then
+            echo "script_dir=$DIR требует вшитый скрипт, а script_file пустой."
+            echo "Без него в IPA не окажется $SCRIPT_NAME и гаджету будет нечего грузить —"
+            echo "на устройстве это выглядит как «ничего не произошло»."
+            exit 1
           fi
 
       - name: custom gadget (optional)
@@ -202,7 +278,6 @@ jobs:
       - name: inject
         env:
           IPA_PATH: work/nofrida.ipa
-          GADGET_CONFIG: work/gadget/FridaGadget.config
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -252,9 +327,24 @@ jobs:
               raise SystemExit('не удалось определить последнюю версию Frida')
 
           ipa = os.environ['IPA_PATH']
-          cfg = os.environ['GADGET_CONFIG']
           script_name = os.environ['SCRIPT_NAME']
           custom = (os.environ.get('CUSTOM_GADGET_URL') or '').strip()
+
+          dylib_name = (os.environ.get('GADGET_DYLIB') or '').strip()
+          stem = (os.environ.get('GADGET_STEM') or '').strip()
+          if not dylib_name or not stem:
+              raise SystemExit('GADGET_DYLIB/GADGET_STEM пусты — шаг gadget config не отработал')
+          fw_name = (os.environ.get('GADGET_FRAMEWORK') or '').strip()
+          if not fw_name.endswith('.framework'):
+              raise SystemExit('GADGET_FRAMEWORK пусто или без .framework: %r' % fw_name)
+          info_plist = os.path.join('work', 'gadget', os.environ['GADGET_FW_STEM'] + '.Info.plist')
+          cfg = os.path.join('work', 'gadget', stem + '.config')
+          if not os.path.exists(cfg):
+              raise SystemExit('нет конфига гаджета: %s' % cfg)
+          if not os.path.exists(info_plist):
+              raise SystemExit('нет Info.plist фреймворка: %s' % info_plist)
+          lc_path = '@executable_path/Frameworks/%s/%s' % (fw_name, dylib_name)
+          print('гаджет: Frameworks/%s/%s, конфиг: %s' % (fw_name, dylib_name, cfg))
 
           if custom:
               version = (os.environ.get('FRIDA_VERSION') or '').strip() or 'custom'
@@ -345,13 +435,20 @@ jobs:
                   return r
               argv = shlex.split(cmd)
               target = argv[-1]
-              name = [a for a in argv if a.startswith('@executable_path/')]
-              if not name or not os.path.exists(target):
+              parsed = [a for a in argv if a.startswith('@executable_path/')]
+              if not parsed or not os.path.exists(target):
                   raise SystemExit('не разобрал вызов insert_dylib: %r' % cmd)
-              add_lc(target, name[0])
-              return _Result('Added LC_LOAD_DYLIB %s' % name[0])
+              # objection 1.12.5 всегда вставляет @executable_path/Frameworks/FridaGadget.dylib:
+              # это единственное место, где имя попадает в load command, — подменяем на путь
+              # внутрь нашего фреймворка
+              wanted = lc_path
+              if parsed[0] != wanted:
+                  print('  подмена имени в LC: %s -> %s' % (parsed[0], wanted))
+              add_lc(target, wanted)
+              return _Result('Added LC_LOAD_DYLIB %s' % wanted)
 
           delegator.run = _run
+          before_libs = set(c.name for c in lief.MachO.parse(p.app_binary).at(0).libraries)
           print('вставляю LC_LOAD_DYLIB (LIEF) и подписываю dylib-ы (может занять минуты)...')
           p.patch_and_codesign_binary(
               frida_gadget=gadget_path,
@@ -360,15 +457,43 @@ jobs:
           print('LC и подписи готовы')
 
           _b = lief.MachO.parse(p.app_binary).at(0)
-          if not any('FridaGadget.dylib' in c.name for c in _b.libraries):
-              raise SystemExit('в %s нет LC_LOAD_DYLIB на FridaGadget' % p.app_binary)
-          print('контроль: библиотек %d, FridaGadget в списке загрузки' % len(_b.libraries))
+          wanted_lc = lc_path
+          added = [c.name for c in _b.libraries if c.name not in before_libs]
+          if added != [wanted_lc]:
+              raise SystemExit('ожидал новую запись загрузки %r, получил: %r' % (wanted_lc, added))
+          print('контроль: библиотек %d, в списке загрузки %s' % (len(_b.libraries), wanted_lc))
           res('после вставки LC')
 
           app = p.app_folder
           frameworks = os.path.join(app, 'Frameworks')
 
-          shutil.copyfile(cfg, os.path.join(frameworks, 'config.json'))
+          # objection жёстко кладёт FridaGadget.dylib и FridaGadget.config в Frameworks,
+          # поэтому переносим их в фреймворк сами: путь обязан совпасть с load command,
+          # а гаджет внутри .framework берёт конфиг как config.json рядом с собой
+          fw_dir = os.path.join(frameworks, fw_name)
+          os.makedirs(fw_dir, exist_ok=True)
+          for old, new in (('FridaGadget.dylib', dylib_name),
+                           ('FridaGadget.config', stem + '.config')):
+              src = os.path.join(frameworks, old)
+              dst = os.path.join(fw_dir, new)
+              if os.path.exists(dst):
+                  continue
+              if not os.path.exists(src):
+                  raise SystemExit('нет ни %s, ни %s в Frameworks' % (old, new))
+              os.replace(src, dst)
+              print('перенесён в фреймворк: Frameworks/%s -> %s/%s' % (old, fw_name, new))
+
+          shutil.copyfile(cfg, os.path.join(fw_dir, 'config.json'))
+          shutil.copyfile(info_plist, os.path.join(fw_dir, 'Info.plist'))
+          for stray in ('FridaGadget.dylib', 'FridaGadget.config'):
+              if os.path.exists(os.path.join(frameworks, stray)):
+                  raise SystemExit('в Frameworks остался %s — перенос в фреймворк не сработал' % stray)
+          for stray in (dylib_name, 'config.json'):
+              if os.path.exists(os.path.join(frameworks, stray)):
+                  print('внимание: в Frameworks уже есть %s — это файл приложения, не трогаю' % stray)
+          print('фреймворк собран: Frameworks/%s (%s, %s.config, config.json, Info.plist)' % (
+              fw_name, dylib_name, stem))
+          print('Frameworks: %r' % sorted(os.listdir(frameworks)))
 
           embed = (os.environ.get('SCRIPT_EMBED') or '1').strip() == '1'
           script_dir = (os.environ.get('SCRIPT_DIR_NORM') or '').strip()
@@ -430,6 +555,13 @@ jobs:
               fi
             done
           done
+          FW_PATH="$APP/Frameworks/$GADGET_FRAMEWORK"
+          if [ -d "$FW_PATH" ]; then
+            codesign -f -s - "$FW_PATH"
+            echo "фреймворк подписан как бандл: $GADGET_FRAMEWORK"
+          else
+            echo "нет каталога $FW_PATH — гаджет лежит не фреймворком"; exit 1
+          fi
           codesign -f -s - $ENTS "$EXEC"
           codesign -f -s - "$APP"
 
@@ -455,11 +587,23 @@ jobs:
           echo "== Frameworks =="
           ls -la "$APP_VERIFY/Frameworks"
 
-          for f in Frameworks/FridaGadget.dylib Frameworks/FridaGadget.config Frameworks/config.json; do
+          echo "== фреймворк гаджета =="
+          ls -la "$APP_VERIFY/Frameworks/$GADGET_FRAMEWORK"
+
+          for f in "Frameworks/$GADGET_FRAMEWORK/$GADGET_DYLIB" \
+                   "Frameworks/$GADGET_FRAMEWORK/$GADGET_STEM.config" \
+                   "Frameworks/$GADGET_FRAMEWORK/config.json" \
+                   "Frameworks/$GADGET_FRAMEWORK/Info.plist"; do
             [ -f "$APP_VERIFY/$f" ] || { echo "в патченом IPA нет $f"; exit 1; }
           done
+          for f in "Frameworks/$GADGET_DYLIB" "Frameworks/$GADGET_STEM.config"; do
+            if [ -e "$APP_VERIFY/$f" ]; then
+              echo "внимание: $f лежит в Frameworks вне фреймворка — это файл приложения,"
+              echo "не наш гаджет: load command смотрит внутрь $GADGET_FRAMEWORK"
+            fi
+          done
           echo "== конфиг гаджета =="
-          cat "$APP_VERIFY/Frameworks/FridaGadget.config"
+          cat "$APP_VERIFY/Frameworks/$GADGET_FRAMEWORK/config.json"
 
           if [ "${SCRIPT_EMBED:-1}" = "1" ] && [ -n "$SCRIPT_FILE" ]; then
             case "$SCRIPT_DIR_NORM" in
@@ -480,15 +624,20 @@ jobs:
           if unzip -Z1 "$OUT_IPA" | grep -qi 'Frida\.framework'; then
             echo "Frida.framework разработчика всё ещё в IPA"; exit 1
           fi
+          if unzip -Z1 "$OUT_IPA" | grep -qi 'FridaGadget'; then
+            echo "в IPA осталось имя FridaGadget — переименование гаджета не сработало:"
+            unzip -Z1 "$OUT_IPA" | grep -i 'FridaGadget'
+            exit 1
+          fi
           FOREIGN="$(unzip -Z1 "$OUT_IPA" | grep -i frida \
-            | grep -viE 'Frameworks/(FridaGadget\.dylib|FridaGadget\.config|config\.json)' \
+            | grep -viE "Frameworks/${GADGET_FRAMEWORK}/" \
             | grep -v "${EXEC_NAME}$" \
             | grep -v "${SCRIPT_NAME}$" || true)"
           [ -z "$FOREIGN" ] || { echo "остались чужие frida-записи:"; echo "$FOREIGN"; exit 1; }
 
           echo "== load commands =="
-          otool -l "work/verify/$BIN_PATH" | grep -A3 LC_LOAD_DYLIB | grep -i frida \
-            || { echo "в бинаре нет LC_LOAD_DYLIB на FridaGadget"; exit 1; }
+          otool -l "work/verify/$BIN_PATH" | grep -A3 LC_LOAD_DYLIB | grep "$GADGET_FRAMEWORK/$GADGET_DYLIB" \
+            || { echo "в бинаре нет LC_LOAD_DYLIB на $GADGET_FRAMEWORK/$GADGET_DYLIB"; exit 1; }
           if otool -l "work/verify/$BIN_PATH" | grep -A3 LC_LOAD_DYLIB | grep -qi 'Frida\.framework'; then
             echo "висячий LC_LOAD_DYLIB на Frida.framework остался"; exit 1
           fi
@@ -498,9 +647,11 @@ jobs:
           echo "версия: $GADGET_VERSION"
           python3 - <<'PY'
           import os, sys
-          p = 'work/verify/%s/Frameworks/FridaGadget.dylib' % os.environ['APP_DIR']
+          p = 'work/verify/%s/Frameworks/%s/%s' % (
+              os.environ['APP_DIR'], os.environ['GADGET_FRAMEWORK'], os.environ['GADGET_DYLIB'])
           n = os.path.getsize(p)
-          print('FridaGadget %d bytes = %.2f MB' % (n, n / 1048576.0))
+          print('%s/%s %d bytes = %.2f MB' % (
+              os.environ['GADGET_FRAMEWORK'], os.environ['GADGET_DYLIB'], n, n / 1048576.0))
           cap = float(os.environ['MAX_MB'])
           if cap > 0 and n / 1048576.0 > cap:
               print('больше лимита %.2f MB' % cap)
@@ -508,7 +659,8 @@ jobs:
           PY
 
           echo "== подписи (ожидается adhoc) =="
-          codesign -dvvv "$APP_VERIFY/Frameworks/FridaGadget.dylib" 2>&1 | grep -E 'Identifier|Signature' || true
+          codesign -dvvv "$APP_VERIFY/Frameworks/$GADGET_FRAMEWORK/$GADGET_DYLIB" 2>&1 | grep -E 'Identifier|Signature' || true
+          codesign -dvvv "$APP_VERIFY/Frameworks/$GADGET_FRAMEWORK" 2>&1 | grep -E 'Identifier|Signature' || true
           codesign -dvvv "$APP_VERIFY/$EXEC_NAME" 2>&1 | grep -E 'Identifier|Signature' || true
           codesign -dvvv "$APP_VERIFY" 2>&1 | grep -E 'Identifier|Signature' || true
 
@@ -531,7 +683,9 @@ jobs:
           name: FridaGadget-${{ inputs.version || 'latest' }}-${{ github.run_number }}
           path: |
             out/*.ipa
-            work/gadget/FridaGadget.config
+            work/gadget/*.config
+            work/gadget/*.json
+            work/gadget/*.plist
             work/strip.log
             work/probe
           if-no-files-found: warn
