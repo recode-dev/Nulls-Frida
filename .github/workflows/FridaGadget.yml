@@ -38,6 +38,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 120
     env:
+      PYTHONUNBUFFERED: "1"
       OBJECTION_VERSION: "1.12.5"
       IPA_URL: ${{ inputs.url }}
       FRIDA_VERSION: ${{ inputs.version }}
@@ -135,6 +136,9 @@ jobs:
           fi
           python3 tools/ExecutablePatch.py "${ARGS[@]}" | tee work/strip.log
           ls -l work/nofrida.ipa exe/
+          rm -f work/app.ipa
+          echo "исходный work/app.ipa удалён; нетронутый исполняемый файл лежит в work/probe"
+          df -h "$GITHUB_WORKSPACE" | tail -1
 
       - name: gadget config
         run: |
@@ -285,12 +289,33 @@ jobs:
           p = IosPatcher(skip_cleanup=True)
           if not p.are_requirements_met():
               raise SystemExit('objection: не все внешние команды найдены (см. предупреждения выше)')
+
+          def res(tag):
+              print('--- ресурсы: %s ---' % tag)
+              for d in (os.environ.get('GITHUB_WORKSPACE', '.'), os.path.dirname(p.temp_file)):
+                  subprocess.run('df -h "%s" | tail -1' % d, shell=True)
+              if shutil.which('vm_stat'):
+                  subprocess.run('vm_stat | head -4', shell=True)
+
+          res('до распаковки')
+          print('распаковываю', ipa)
           p.extract_ipa(False, ipa_source=ipa)
+          print('распаковано:', p.app_folder)
+          for dup in (p.temp_file, ipa):
+              try:
+                  os.remove(dup)
+                  print('дубликат удалён:', dup)
+              except OSError as e:
+                  print('не удалось удалить %s: %r' % (dup, e))
+          res('после распаковки')
           p.set_application_binary()
+          print('вставляю LC_LOAD_DYLIB и подписываю dylib-ы (может занять минуты)...')
           p.patch_and_codesign_binary(
               frida_gadget=gadget_path,
               codesign_signature='-',
               gadget_config=cfg)
+          print('LC и подписи готовы')
+          res('после вставки LC')
 
           app = p.app_folder
           frameworks = os.path.join(app, 'Frameworks')
@@ -311,9 +336,9 @@ jobs:
               shutil.copyfile(script_src, os.path.join(target_dir, script_name))
               print('вшит скрипт:', os.path.relpath(os.path.join(target_dir, script_name), app))
 
-          dest = os.path.join('work', 'patched-app', os.path.basename(app))
-          shutil.rmtree(dest, ignore_errors=True)
-          shutil.copytree(app, dest, symlinks=True)
+          dest = app
+          with open('work/patched-app-path.txt', 'w') as f:
+              f.write(dest + '\n')
 
           with open(os.environ['GITHUB_ENV'], 'a') as f:
               f.write('APP_NAME=%s\n' % os.path.basename(app))
@@ -324,8 +349,11 @@ jobs:
           PY
 
           echo "== содержимое бандла =="
-          ls -la work/patched-app/*/
-          ls -la work/patched-app/*/Frameworks
+          APPDIR="$(tail -1 work/patched-app-path.txt)"
+          echo "бандл: $APPDIR"
+          ls -la "$APPDIR"/ | head -40
+          ls -la "$APPDIR"/Frameworks | head -40
+          df -h "$GITHUB_WORKSPACE" | tail -1
 
       - name: ad-hoc sign and pack
         run: |
@@ -333,12 +361,12 @@ jobs:
           APP="$PATCHED_APP_DIR"
           EXEC="$APP/$EXEC_NAME"
           [ -f "$EXEC" ] || { echo "нет исполняемого файла $EXEC"; exit 1; }
+          df -h "$GITHUB_WORKSPACE" | tail -1
 
-          ORIG_BIN="$APP_DIR/$EXEC_NAME"
-          rm -rf work/orig && mkdir -p work/orig
-          unzip -o -q work/app.ipa "$ORIG_BIN" -d work/orig
+          ORIG_BIN="work/probe/$APP_DIR/$EXEC_NAME"
+          [ -f "$ORIG_BIN" ] || { echo "нет нетронутого оригинала $ORIG_BIN"; exit 1; }
           ENTS=""
-          if codesign -d --entitlements :- "work/orig/$ORIG_BIN" > work/ents.plist 2>/dev/null \
+          if codesign -d --entitlements :- "$ORIG_BIN" > work/ents.plist 2>/dev/null \
              && [ -s work/ents.plist ] && [ "$(head -c 1 work/ents.plist)" = "<" ]; then
             ENTS="--entitlements work/ents.plist"
             echo "entitlements оригинала подключены"
