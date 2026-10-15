@@ -405,6 +405,11 @@ jobs:
           import delegator
           import lief
 
+          # числа считаем только там, где LIEF разбирает файл уже с диска после записи:
+          # предварительный разбор того же бинаря до патча может вернуть пустой список
+          # библиотек, и тогда «новой записью» окажется всё, что есть в бинаре
+          lc_applied = {}
+
           def add_lc(path, name):
               b = lief.MachO.parse(path).at(0)
               before = len(b.libraries)
@@ -415,6 +420,8 @@ jobs:
               names = [x.name for x in c.libraries]
               if name not in names or len(names) != before + 1:
                   raise SystemExit('LC_LOAD_DYLIB не встал: %d -> %d' % (before, len(names)))
+              lc_applied['before'] = before
+              lc_applied['after'] = len(names)
               print('  LC_LOAD_DYLIB %s (%d -> %d библиотек), chained fixups: %s' % (
                   name, before, len(names), c.has_dyld_chained_fixups))
               return names
@@ -448,7 +455,6 @@ jobs:
               return _Result('Added LC_LOAD_DYLIB %s' % wanted)
 
           delegator.run = _run
-          before_libs = set(c.name for c in lief.MachO.parse(p.app_binary).at(0).libraries)
           print('вставляю LC_LOAD_DYLIB (LIEF) и подписываю dylib-ы (может занять минуты)...')
           p.patch_and_codesign_binary(
               frida_gadget=gadget_path,
@@ -456,12 +462,19 @@ jobs:
               gadget_config=cfg)
           print('LC и подписи готовы')
 
-          _b = lief.MachO.parse(p.app_binary).at(0)
           wanted_lc = lc_path
-          added = [c.name for c in _b.libraries if c.name not in before_libs]
-          if added != [wanted_lc]:
-              raise SystemExit('ожидал новую запись загрузки %r, получил: %r' % (wanted_lc, added))
-          print('контроль: библиотек %d, в списке загрузки %s' % (len(_b.libraries), wanted_lc))
+          if not lc_applied:
+              raise SystemExit('insert_dylib ни разу не вызвался — LC_LOAD_DYLIB не вставлен')
+          names_now = [c.name for c in lief.MachO.parse(p.app_binary).at(0).libraries]
+          hits = names_now.count(wanted_lc)
+          if hits != 1:
+              raise SystemExit('LC_LOAD_DYLIB на %r встречается %d раз (ожидал 1); в бинаре %d библиотек' % (
+                  wanted_lc, hits, len(names_now)))
+          if len(names_now) != lc_applied['after']:
+              print('внимание: библиотек %d, ожидал %d — список загрузки изменился после подписи' % (
+                  len(names_now), lc_applied['after']))
+          print('контроль: библиотек %d (было %d), в списке загрузки %s' % (
+              len(names_now), lc_applied['before'], wanted_lc))
           res('после вставки LC')
 
           app = p.app_folder
