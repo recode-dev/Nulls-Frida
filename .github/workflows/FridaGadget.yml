@@ -200,27 +200,70 @@ jobs:
         env:
           IPA_PATH: work/nofrida.ipa
           GADGET_CONFIG: work/gadget/FridaGadget.config
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import os
+          import re
           import shutil
+          import subprocess
 
+          import requests
           from objection.utils.patchers.github import Github
           from objection.utils.patchers.ios import IosGadget, IosPatcher
+
+          token = (os.environ.get('GITHUB_TOKEN') or '').strip()
+          _s = requests.Session()
+          _s.headers.update({
+              'User-Agent': 'Nulls-Frida-Workflow',
+              'Accept': 'application/vnd.github+json',
+          })
+          if token:
+              _s.headers['Authorization'] = 'Bearer ' + token
+          requests.get = _s.get
+
+          def resolve_version():
+              want = (os.environ.get('FRIDA_VERSION') or '').strip()
+              if want:
+                  return want
+              try:
+                  r = requests.get('https://api.github.com/repos/frida/frida/releases/latest', timeout=30)
+                  print('github api: status %s, rate-limit remaining %s' % (
+                      r.status_code, r.headers.get('x-ratelimit-remaining', 'n/a')))
+                  tag = r.json().get('tag_name')
+                  if tag:
+                      return tag
+                  print('github api: ответ без tag_name:', r.text[:300])
+              except Exception as e:
+                  print('github api недоступен: %r' % e)
+              try:
+                  r = requests.get('https://github.com/frida/frida/releases/latest', timeout=30)
+                  tag = r.url.rstrip('/').rsplit('/', 1)[-1]
+                  if re.fullmatch(r'\d+\.\d+\.\d+', tag):
+                      print('версия из редиректа releases/latest:', tag)
+                      return tag
+                  print('редирект не дал версию:', r.url)
+              except Exception as e:
+                  print('редирект недоступен: %r' % e)
+              raise SystemExit('не удалось определить последнюю версию Frida')
 
           ipa = os.environ['IPA_PATH']
           cfg = os.environ['GADGET_CONFIG']
           script_name = os.environ['SCRIPT_NAME']
-          want = (os.environ.get('FRIDA_VERSION') or '').strip()
           custom = (os.environ.get('CUSTOM_GADGET_URL') or '').strip()
 
-          gh = Github()
-          version = want or gh.get_latest_version()
+          if custom:
+              version = (os.environ.get('FRIDA_VERSION') or '').strip() or 'custom'
+          else:
+              version = resolve_version()
+          if version != 'custom' and not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise SystemExit('подозрительный номер версии: %r' % version)
           print('frida release:', version)
 
           gadget = IosGadget(Github(gadget_version=version))
           gadget_path = gadget.get_gadget_path()
+          archive = os.path.join(os.path.expanduser('~'), '.objection', 'ios', 'FridaGadget.dylib.xz')
 
           if custom:
               if not os.path.exists(gadget_path):
@@ -229,8 +272,12 @@ jobs:
           elif gadget.gadget_exists() and gadget.get_local_version('ios_universal') == version:
               print('гаджет уже в кэше:', gadget_path)
           else:
-              print('качаю релизный гаджет...')
-              gadget.download().unpack().set_local_version('ios_universal', version).cleanup()
+              dl = 'https://github.com/frida/frida/releases/download/%s/frida-gadget-%s-ios-universal.dylib.xz' % (version, version)
+              print('качаю гаджет напрямую: %s' % dl)
+              subprocess.run(['curl', '-fL', '--retry', '3', '--retry-delay', '2', '--max-time', '600', '-o', archive, dl], check=True)
+              if os.path.getsize(archive) == 0:
+                  raise SystemExit('пустой архив гаджета: %s' % archive)
+              gadget.unpack().set_local_version('ios_universal', version).cleanup()
 
           size = os.path.getsize(gadget_path)
           print('gadget: %s (%d bytes)' % (gadget_path, size))
