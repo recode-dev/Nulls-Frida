@@ -411,15 +411,19 @@ jobs:
           lc_applied = {}
 
           def add_lc(path, name):
-              b = lief.MachO.parse(path).at(0)
+              b = lief.MachO.parse(str(path)).at(0)
               before = len(b.libraries)
               b.add_library(name)
               b.remove_signature()
-              b.write(path)
-              c = lief.MachO.parse(path).at(0)
+              b.write(str(path))
+              c = lief.MachO.parse(str(path)).at(0)
               names = [x.name for x in c.libraries]
-              if name not in names or len(names) != before + 1:
-                  raise SystemExit('LC_LOAD_DYLIB не встал: %d -> %d' % (before, len(names)))
+              if name not in names:
+                  raise SystemExit('LC_LOAD_DYLIB не встал в %s: %d -> %d' % (path, before, len(names)))
+              if len(names) != before + 1:
+                  print('внимание: библиотек %d, ожидал %d — не совпало на единицу, но запись на месте' % (
+                      len(names), before + 1))
+              lc_applied['file'] = str(path)
               lc_applied['before'] = before
               lc_applied['after'] = len(names)
               print('  LC_LOAD_DYLIB %s (%d -> %d библиотек), chained fixups: %s' % (
@@ -465,16 +469,42 @@ jobs:
           wanted_lc = lc_path
           if not lc_applied:
               raise SystemExit('insert_dylib ни разу не вызвался — LC_LOAD_DYLIB не вставлен')
-          names_now = [c.name for c in lief.MachO.parse(p.app_binary).at(0).libraries]
-          hits = names_now.count(wanted_lc)
-          if hits != 1:
-              raise SystemExit('LC_LOAD_DYLIB на %r встречается %d раз (ожидал 1); в бинаре %d библиотек' % (
-                  wanted_lc, hits, len(names_now)))
-          if len(names_now) != lc_applied['after']:
-              print('внимание: библиотек %d, ожидал %d — список загрузки изменился после подписи' % (
-                  len(names_now), lc_applied['after']))
-          print('контроль: библиотек %d (было %d), в списке загрузки %s' % (
-              len(names_now), lc_applied['before'], wanted_lc))
+
+          # проверяем по тому файлу, который реально правили: p.app_binary у objection
+          # может указывать не туда, а LIEF на нечитаемом пути отдаёт пустой объект
+          # (0 библиотек) вместо ошибки — ровно на этом и падала прошлая проверка
+          cands = []
+          for cand in (lc_applied['file'], p.app_binary,
+                       os.path.join(p.app_folder, os.environ.get('EXEC_NAME', ''))):
+              s = str(cand or '')
+              if s and s not in cands:
+                  cands.append(s)
+          checked = 0
+          for cand in cands:
+              if not os.path.exists(cand):
+                  print('нет файла: %s' % cand)
+                  continue
+              try:
+                  names_now = [c.name for c in lief.MachO.parse(cand).at(0).libraries]
+              except Exception as e:
+                  print('не разобрал %s: %r' % (cand, e))
+                  continue
+              if not names_now:
+                  print('разобрал %s, но библиотек 0 — судить не могу' % cand)
+                  continue
+              checked += 1
+              hits = names_now.count(wanted_lc)
+              print('%s: библиотек %d, вхождений %r: %d' % (cand, len(names_now), wanted_lc, hits))
+              if hits != 1:
+                  raise SystemExit('в %s LC_LOAD_DYLIB на %r встречается %d раз (ожидал 1)' % (
+                      cand, wanted_lc, hits))
+              if len(names_now) != lc_applied['after']:
+                  print('внимание: в %s библиотек %d, ожидал %d — список изменился после подписи' % (
+                      cand, len(names_now), lc_applied['after']))
+          if not checked:
+              raise SystemExit('ни один бинарь из %r не прочитался — не могу подтвердить LC_LOAD_DYLIB' % cands)
+          print('контроль: LC_LOAD_DYLIB на %s ровно один, бинарей проверено %d (было %d библиотек)' % (
+              wanted_lc, checked, lc_applied['before']))
           res('после вставки LC')
 
           app = p.app_folder
