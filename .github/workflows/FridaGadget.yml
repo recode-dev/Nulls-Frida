@@ -63,24 +63,23 @@ jobs:
       - name: toolchain
         run: |
           set -euo pipefail
-          mkdir -p work out
+          mkdir -p work out tools/bin
 
           python3 -m pip install --quiet --upgrade pip
           python3 -m pip install --quiet lief "objection==${OBJECTION_VERSION}"
 
-          git clone --depth 1 https://github.com/Tyilo/insert_dylib insert_dylib-src
-          (cd insert_dylib-src && xcodebuild -configuration Release >/dev/null)
-          BIN="$(find insert_dylib-src -type f -name insert_dylib -perm -111 | head -1)"
-          [ -n "$BIN" ] || { echo "insert_dylib не собрался"; exit 1; }
-          sudo cp -f "$BIN" /usr/local/bin/insert_dylib
-          chmod +x /usr/local/bin/insert_dylib
+          printf '%s\n' '#!/bin/sh' 'echo "insert_dylib: заглушка; LC_LOAD_DYLIB вставляет LIEF в шаге inject" >&2' 'exit 1' > tools/bin/insert_dylib
+          chmod +x tools/bin/insert_dylib
+          echo "$GITHUB_WORKSPACE/tools/bin" >> "$GITHUB_PATH"
+          test -x tools/bin/insert_dylib
 
           python3 -c 'import lief; print("lief", lief.__version__)'
           objection version 2>&1 | tail -1 || true
           npm install -g applesign
-          for c in insert_dylib codesign security zip unzip plutil xcodebuild applesign; do
+          for c in codesign security zip unzip plutil xcodebuild applesign; do
             command -v "$c" || { echo "нет обязательной команды: $c"; exit 1; }
           done
+          echo "обязательные команды на месте; внешний insert_dylib не нужен"
 
       - name: fetch
         run: |
@@ -309,12 +308,61 @@ jobs:
                   print('не удалось удалить %s: %r' % (dup, e))
           res('после распаковки')
           p.set_application_binary()
-          print('вставляю LC_LOAD_DYLIB и подписываю dylib-ы (может занять минуты)...')
+
+          import shlex
+          import time
+
+          import delegator
+          import lief
+
+          def add_lc(path, name):
+              b = lief.MachO.parse(path).at(0)
+              before = len(b.libraries)
+              b.add_library(name)
+              b.remove_signature()
+              b.write(path)
+              c = lief.MachO.parse(path).at(0)
+              names = [x.name for x in c.libraries]
+              if name not in names or len(names) != before + 1:
+                  raise SystemExit('LC_LOAD_DYLIB не встал: %d -> %d' % (before, len(names)))
+              print('  LC_LOAD_DYLIB %s (%d -> %d библиотек), chained fixups: %s' % (
+                  name, before, len(names), c.has_dyld_chained_fixups))
+              return names
+
+          _real_run = delegator.run
+
+          class _Result(object):
+              def __init__(self, out='', err='', rc=0):
+                  self.out = out
+                  self.err = err
+                  self.return_code = rc
+
+          def _run(cmd, *args, **kwargs):
+              if 'insert_dylib' not in cmd:
+                  t0 = time.time()
+                  r = _real_run(cmd, *args, **kwargs)
+                  print('  %-22s rc=%s, %.1fs' % (cmd.split()[0].rsplit('/', 1)[-1], r.return_code, time.time() - t0))
+                  return r
+              argv = shlex.split(cmd)
+              target = argv[-1]
+              name = [a for a in argv if a.startswith('@executable_path/')]
+              if not name or not os.path.exists(target):
+                  raise SystemExit('не разобрал вызов insert_dylib: %r' % cmd)
+              add_lc(target, name[0])
+              return _Result('Added LC_LOAD_DYLIB %s' % name[0])
+
+          delegator.run = _run
+          print('вставляю LC_LOAD_DYLIB (LIEF) и подписываю dylib-ы (может занять минуты)...')
           p.patch_and_codesign_binary(
               frida_gadget=gadget_path,
               codesign_signature='-',
               gadget_config=cfg)
           print('LC и подписи готовы')
+
+          _b = lief.MachO.parse(p.app_binary).at(0)
+          if not any('FridaGadget.dylib' in c.name for c in _b.libraries):
+              raise SystemExit('в %s нет LC_LOAD_DYLIB на FridaGadget' % p.app_binary)
+          print('контроль: библиотек %d, FridaGadget в списке загрузки' % len(_b.libraries))
           res('после вставки LC')
 
           app = p.app_folder
