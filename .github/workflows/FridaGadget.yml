@@ -405,18 +405,40 @@ jobs:
           import delegator
           import lief
 
-          # числа считаем только там, где LIEF разбирает файл уже с диска после записи:
-          # предварительный разбор того же бинаря до патча может вернуть пустой список
-          # библиотек, и тогда «новой записью» окажется всё, что есть в бинаре
+          # LIEF держит списки внутри объектов-родителей: если разбирать файл одним
+          # выражением (lief.MachO.parse(p).at(0).libraries), промежуточный объект
+          # умирает раньше чтения — список приходит пустым, а на части сборок LIEF
+          # это вообще segfault. Поэтому здесь всё привязано к именам, а проверку
+          # ниже читаем вообще не LIEF-ом, а otool-ом
           lc_applied = {}
 
+          def loaded_libs(path):
+              # otool -L: первая строка — сам файл, дальше по строке на LC_LOAD_DYLIB
+              r = subprocess.run(['otool', '-L', path], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print('otool -L %s: rc=%s %s' % (path, r.returncode, r.stderr.strip()[:200]))
+                  return None
+              names = []
+              for line in r.stdout.splitlines()[1:]:
+                  line = line.strip()
+                  if line:
+                      names.append(line.split(' (')[0].strip())
+              return names
+
           def add_lc(path, name):
-              b = lief.MachO.parse(str(path)).at(0)
+              fat = lief.MachO.parse(str(path))
+              if fat is None:
+                  raise SystemExit('LIEF не открыл %s' % path)
+              b = fat.at(0)
               before = len(b.libraries)
               b.add_library(name)
               b.remove_signature()
               b.write(str(path))
-              c = lief.MachO.parse(str(path)).at(0)
+
+              after = lief.MachO.parse(str(path))
+              if after is None:
+                  raise SystemExit('после записи LIEF не открыл %s' % path)
+              c = after.at(0)
               names = [x.name for x in c.libraries]
               if name not in names:
                   raise SystemExit('LC_LOAD_DYLIB не встал в %s: %d -> %d' % (path, before, len(names)))
@@ -470,9 +492,8 @@ jobs:
           if not lc_applied:
               raise SystemExit('insert_dylib ни разу не вызвался — LC_LOAD_DYLIB не вставлен')
 
-          # проверяем по тому файлу, который реально правили: p.app_binary у objection
-          # может указывать не туда, а LIEF на нечитаемом пути отдаёт пустой объект
-          # (0 библиотек) вместо ошибки — ровно на этом и падала прошлая проверка
+          # проверяем по тому файлу, который реально правили, и читаем его otool-ом:
+          # разбор LIEF-ом одного и того же файла уже дважды отдавал пустой список
           cands = []
           for cand in (lc_applied['file'], p.app_binary,
                        os.path.join(p.app_folder, os.environ.get('EXEC_NAME', ''))):
@@ -484,27 +505,20 @@ jobs:
               if not os.path.exists(cand):
                   print('нет файла: %s' % cand)
                   continue
-              try:
-                  names_now = [c.name for c in lief.MachO.parse(cand).at(0).libraries]
-              except Exception as e:
-                  print('не разобрал %s: %r' % (cand, e))
-                  continue
+              names_now = loaded_libs(cand)
               if not names_now:
-                  print('разобрал %s, но библиотек 0 — судить не могу' % cand)
+                  print('пустой список зависимостей у %s — судить не могу' % cand)
                   continue
               checked += 1
               hits = names_now.count(wanted_lc)
-              print('%s: библиотек %d, вхождений %r: %d' % (cand, len(names_now), wanted_lc, hits))
+              print('%s: зависимостей %d, вхождений %r: %d' % (cand, len(names_now), wanted_lc, hits))
               if hits != 1:
                   raise SystemExit('в %s LC_LOAD_DYLIB на %r встречается %d раз (ожидал 1)' % (
                       cand, wanted_lc, hits))
-              if len(names_now) != lc_applied['after']:
-                  print('внимание: в %s библиотек %d, ожидал %d — список изменился после подписи' % (
-                      cand, len(names_now), lc_applied['after']))
           if not checked:
               raise SystemExit('ни один бинарь из %r не прочитался — не могу подтвердить LC_LOAD_DYLIB' % cands)
-          print('контроль: LC_LOAD_DYLIB на %s ровно один, бинарей проверено %d (было %d библиотек)' % (
-              wanted_lc, checked, lc_applied['before']))
+          print('контроль: LC_LOAD_DYLIB на %s ровно один, бинарей проверено %d (LIEF насчитал %d библиотек)' % (
+              wanted_lc, checked, lc_applied['after']))
           res('после вставки LC')
 
           app = p.app_folder
