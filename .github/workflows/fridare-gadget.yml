@@ -39,15 +39,13 @@ jobs:
 
           VERSION="${{ inputs.frida_version }}"
           if [ -z "$VERSION" ]; then
-            echo "[-] версия не указана, запрашиваю последний стабильный релиз..."
             VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "[-] использую версию: $VERSION"
+          echo "[-] версия: $VERSION"
 
           SRC_URL="${{ inputs.custom_source_url }}"
           if [ -n "$SRC_URL" ]; then
-            echo "[-] качаю пользовательский гаджет: $SRC_URL"
             curl -fL --retry 3 --max-time 600 -o custom-gadget.dylib "$SRC_URL"
             echo "INPUT_DYLIB=custom-gadget.dylib" >> "$GITHUB_ENV"
             exit 0
@@ -77,8 +75,7 @@ jobs:
 import sys, json
 try:
     data = json.load(sys.stdin)
-    assets = data.get('assets', [])
-    for a in assets:
+    for a in data.get('assets', []):
         name = a.get('name', '')
         if 'ios-universal' in name and name.endswith(('.gz', '.xz')):
             print(name)
@@ -87,8 +84,7 @@ except Exception:
     pass
 ")
             if [ -z "$REAL_ASSET" ]; then
-              echo "[-] в релизе ${VERSION} не найден ассет ios-universal (возможно, версия не существует)"
-              echo "[-] проверьте доступные версии: https://github.com/frida/frida/releases"
+              echo "[-] в релизе ${VERSION} нет ios-universal ассета"
               exit 1
             fi
             echo "[-] API подсказал имя: $REAL_ASSET"
@@ -106,7 +102,7 @@ except Exception:
           echo "INPUT_DYLIB=$INPUT_DYLIB" >> "$GITHUB_ENV"
           echo "[-] готов исходный гаджет: $INPUT_DYLIB"
 
-      - name: Патч гаджета через Fridare (случайное имя)
+      - name: Патч гаджета через Fridare
         run: |
           set -euo pipefail
           bash tools/patch_gadget.sh "$INPUT_DYLIB"
