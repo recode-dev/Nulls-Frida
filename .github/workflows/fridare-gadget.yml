@@ -7,10 +7,6 @@ on:
         description: "Тег Frida; пусто = последний релиз"
         required: false
         default: ""
-      gadget_name:
-        description: "Имя выходного файла гаджета"
-        required: false
-        default: "Recoil.dylib"
       custom_source_url:
         description: "Необязательно: URL своего исходного .dylib"
         required: false
@@ -29,10 +25,8 @@ jobs:
       - name: Установка зависимостей и Fridare
         run: |
           set -euo pipefail
-          command -v git
-          command -v curl
+          command -v git && command -v curl
           command -v xz || brew install xz
-          command -v lipo
           chmod +x tools/install_fridare.sh tools/patch_gadget.sh
           bash tools/install_fridare.sh
 
@@ -40,50 +34,44 @@ jobs:
         id: fetch
         run: |
           set -euo pipefail
-
           VERSION="${{ inputs.frida_version }}"
           if [ -z "$VERSION" ]; then
             VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | grep -oP '"tag_name": "\K[^"]+')
-            echo "[-] версия не указана, использую последний релиз: $VERSION"
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           SRC_URL="${{ inputs.custom_source_url }}"
           if [ -z "$SRC_URL" ]; then
             SRC_URL="https://github.com/frida/frida/releases/download/${VERSION}/frida-gadget-${VERSION}-ios-universal.dylib.xz"
-            echo "[-] качаю официальный гаджет: $SRC_URL"
-            curl -fL --retry 3 --max-time 600 -o work-frida-gadget.dylib.xz "$SRC_URL"
-            unxz -f work-frida-gadget.dylib.xz
-            INPUT_DYLIB="work-frida-gadget.dylib"
+            curl -fL --retry 3 --max-time 600 -o gadget.dylib.xz "$SRC_URL"
+            unxz -f gadget.dylib.xz
+            INPUT_DYLIB="gadget.dylib"
           else
-            echo "[-] качаю пользовательский гаджет: $SRC_URL"
             curl -fL --retry 3 --max-time 600 -o custom-gadget.dylib "$SRC_URL"
             INPUT_DYLIB="custom-gadget.dylib"
           fi
-
-          [ -f "$INPUT_DYLIB" ] || { echo "[-] исходный гаджет не получен"; exit 1; }
           echo "INPUT_DYLIB=$INPUT_DYLIB" >> "$GITHUB_ENV"
-          echo "input_dylib=$INPUT_DYLIB" >> "$GITHUB_OUTPUT"
 
-      - name: Патч гаджета через Fridare
+      - name: Патч гаджета через Fridare (со случайным именем)
         run: |
           set -euo pipefail
-          OUTPUT_NAME="${{ inputs.gadget_name }}"
-          case "$OUTPUT_NAME" in
-            *.dylib) ;;
-            *) OUTPUT_NAME="${OUTPUT_NAME}.dylib" ;;
-          esac
-          echo "OUTPUT_NAME=$OUTPUT_NAME" >> "$GITHUB_ENV"
-          bash tools/patch_gadget.sh "$INPUT_DYLIB" "$OUTPUT_NAME"
+          bash tools/patch_gadget.sh "$INPUT_DYLIB"
+
+          PATCHED=$(find . -maxdepth 1 -name "*.dylib" -newer "$INPUT_DYLIB" | head -1)
+          if [ -z "$PATCHED" ]; then
+            # Если не нашли, пробуем найти файл с произвольным именем
+            PATCHED=$(find . -maxdepth 1 -name "*.dylib" ! -name "$INPUT_DYLIB" | head -1)
+          fi
+          [ -n "$PATCHED" ] || { echo "[-] не удалось найти созданный файл"; exit 1; }
+          echo "PATCHED_DYLIB=$PATCHED" >> "$GITHUB_ENV"
+          echo "[+] создан файл: $PATCHED"
 
       - name: Проверка и загрузка артефакта
         run: |
           set -euo pipefail
-          [ -f "$OUTPUT_NAME" ] || { echo "[-] итоговый файл не найден: $OUTPUT_NAME"; exit 1; }
-          echo "[+] размер: $(du -h "$OUTPUT_NAME" | cut -f1)"
-          echo "[+] архитектуры: $(lipo -archs "$OUTPUT_NAME" 2>/dev/null || echo 'n/a')"
-          if strings "$OUTPUT_NAME" | grep -qi 'LIBFRIDA'; then
+          echo "[+] размер: $(du -h "$PATCHED_DYLIB" | cut -f1)"
+          echo "[+] архитектуры: $(lipo -archs "$PATCHED_DYLIB" 2>/dev/null || echo 'n/a')"
+          if strings "$PATCHED_DYLIB" | grep -qi 'LIBFRIDA'; then
             echo "[!] в бинарнике всё ещё встречается LIBFRIDA"
           else
             echo "[+] явных строк LIBFRIDA не найдено"
@@ -92,6 +80,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: fridare-gadget-${{ env.VERSION || 'latest' }}
-          path: ${{ env.OUTPUT_NAME }}
-          compression-level: 0
+          path: ${{ env.PATCHED_DYLIB }}
           if-no-files-found: error
