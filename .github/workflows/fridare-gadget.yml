@@ -39,7 +39,7 @@ jobs:
 
           VERSION="${{ inputs.frida_version }}"
           if [ -z "$VERSION" ]; then
-            VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+            VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | jq -r '.tag_name')
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "[-] версия: $VERSION"
@@ -70,19 +70,9 @@ jobs:
 
           if [ -z "$DOWNLOADED" ]; then
             echo "[-] прямые ссылки не сработали, запрашиваю список ассетов через API..."
-            API_JSON=$(curl -s "https://api.github.com/repos/frida/frida/releases/tags/${VERSION}")
-            REAL_ASSET=$(printf '%s' "$API_JSON" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for a in data.get('assets', []):
-        name = a.get('name', '')
-        if 'ios-universal' in name and name.endswith(('.gz', '.xz')):
-            print(name)
-            break
-except Exception:
-    pass
-")
+            REAL_ASSET=$(curl -s "https://api.github.com/repos/frida/frida/releases/tags/${VERSION}" \
+              | jq -r '.assets[]?.name | select(test("ios-universal") and test("\\.(gz|xz)$"))' \
+              | head -1 || true)
             if [ -z "$REAL_ASSET" ]; then
               echo "[-] в релизе ${VERSION} нет ios-universal ассета"
               exit 1
