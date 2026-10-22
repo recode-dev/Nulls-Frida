@@ -25,8 +25,10 @@ jobs:
       - name: Установка зависимостей и Fridare
         run: |
           set -euo pipefail
-          command -v git && command -v curl
+          command -v git
+          command -v curl
           command -v xz || brew install xz
+          command -v lipo
           chmod +x tools/install_fridare.sh tools/patch_gadget.sh
           bash tools/install_fridare.sh
 
@@ -34,6 +36,7 @@ jobs:
         id: fetch
         run: |
           set -euo pipefail
+
           VERSION="${{ inputs.frida_version }}"
           if [ -z "$VERSION" ]; then
             VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | grep -oP '"tag_name": "\K[^"]+')
@@ -41,26 +44,57 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
           SRC_URL="${{ inputs.custom_source_url }}"
-          if [ -z "$SRC_URL" ]; then
-            SRC_URL="https://github.com/frida/frida/releases/download/${VERSION}/frida-gadget-${VERSION}-ios-universal.dylib.xz"
-            curl -fL --retry 3 --max-time 600 -o gadget.dylib.xz "$SRC_URL"
-            unxz -f gadget.dylib.xz
-            INPUT_DYLIB="gadget.dylib"
-          else
+          if [ -n "$SRC_URL" ]; then
+            echo "[-] качаю пользовательский гаджет: $SRC_URL"
             curl -fL --retry 3 --max-time 600 -o custom-gadget.dylib "$SRC_URL"
-            INPUT_DYLIB="custom-gadget.dylib"
+            echo "INPUT_DYLIB=custom-gadget.dylib" >> "$GITHUB_ENV"
+            exit 0
           fi
-          echo "INPUT_DYLIB=$INPUT_DYLIB" >> "$GITHUB_ENV"
 
-      - name: Патч гаджета через Fridare (со случайным именем)
+          BASE="https://github.com/frida/frida/releases/download/${VERSION}"
+          ASSETS=(
+            "frida-gadget-${VERSION}-ios-universal.dylib.gz"
+            "frida-gadget-${VERSION}-ios-universal.dylib.xz"
+          )
+
+          DOWNLOADED=""
+          for asset in "${ASSETS[@]}"; do
+            echo "[-] пробую: $BASE/$asset"
+            if curl -fL --retry 2 --max-time 600 -o "$asset" "$BASE/$asset"; then
+              DOWNLOADED="$asset"
+              break
+            fi
+            rm -f "$asset"
+          done
+
+          if [ -z "$DOWNLOADED" ]; then
+            echo "[-] прямые ссылки не сработали, запрашиваю список ассетов через API..."
+            API_JSON=$(curl -s "https://api.github.com/repos/frida/frida/releases/tags/${VERSION}")
+            REAL_ASSET=$(printf '%s' "$API_JSON" | grep -oP '"name": "\K[^"]*ios-universal[^"]*' | head -1 || true)
+            [ -n "$REAL_ASSET" ] || { echo "[-] в релизе ${VERSION} нет ios-universal ассета"; exit 1; }
+            echo "[-] API подсказал имя: $REAL_ASSET"
+            curl -fL --retry 3 --max-time 600 -o "$REAL_ASSET" "$BASE/$REAL_ASSET"
+            DOWNLOADED="$REAL_ASSET"
+          fi
+
+          case "$DOWNLOADED" in
+            *.gz)  gzip -dk "$DOWNLOADED" && INPUT_DYLIB="${DOWNLOADED%.gz}" ;;
+            *.xz)  unxz -f "$DOWNLOADED" && INPUT_DYLIB="${DOWNLOADED%.xz}" ;;
+            *)     echo "[-] неизвестное расширение: $DOWNLOADED"; exit 1 ;;
+          esac
+
+          [ -f "$INPUT_DYLIB" ] || { echo "[-] распаковка не дала dylib"; exit 1; }
+          echo "INPUT_DYLIB=$INPUT_DYLIB" >> "$GITHUB_ENV"
+          echo "[-] готов исходный гаджет: $INPUT_DYLIB"
+
+      - name: Патч гаджета через Fridare (случайное имя)
         run: |
           set -euo pipefail
           bash tools/patch_gadget.sh "$INPUT_DYLIB"
 
-          PATCHED=$(find . -maxdepth 1 -name "*.dylib" -newer "$INPUT_DYLIB" | head -1)
+          PATCHED=$(find . -maxdepth 2 -name "*.dylib" -newer "$INPUT_DYLIB" ! -name "$INPUT_DYLIB" | head -1)
           if [ -z "$PATCHED" ]; then
-            # Если не нашли, пробуем найти файл с произвольным именем
-            PATCHED=$(find . -maxdepth 1 -name "*.dylib" ! -name "$INPUT_DYLIB" | head -1)
+            PATCHED=$(find . -maxdepth 2 -name "*.dylib" ! -name "$INPUT_DYLIB" ! -name "custom-gadget.dylib" | head -1)
           fi
           [ -n "$PATCHED" ] || { echo "[-] не удалось найти созданный файл"; exit 1; }
           echo "PATCHED_DYLIB=$PATCHED" >> "$GITHUB_ENV"
@@ -69,6 +103,7 @@ jobs:
       - name: Проверка и загрузка артефакта
         run: |
           set -euo pipefail
+          [ -f "$PATCHED_DYLIB" ] || { echo "[-] нет файла: $PATCHED_DYLIB"; exit 1; }
           echo "[+] размер: $(du -h "$PATCHED_DYLIB" | cut -f1)"
           echo "[+] архитектуры: $(lipo -archs "$PATCHED_DYLIB" 2>/dev/null || echo 'n/a')"
           if strings "$PATCHED_DYLIB" | grep -qi 'LIBFRIDA'; then
@@ -81,4 +116,5 @@ jobs:
         with:
           name: fridare-gadget-${{ env.VERSION || 'latest' }}
           path: ${{ env.PATCHED_DYLIB }}
+          compression-level: 0
           if-no-files-found: error
